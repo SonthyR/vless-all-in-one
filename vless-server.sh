@@ -29,6 +29,10 @@ readonly ACME_DEFAULT_EMAIL="acme@vaio.com"
 readonly CURL_TIMEOUT_FAST=5
 readonly CURL_TIMEOUT_NORMAL=10
 readonly CURL_TIMEOUT_DOWNLOAD=60
+readonly LATENCY_TEST_URL="https://www.gstatic.com/generate_204"
+readonly LATENCY_PARALLEL="${LATENCY_PARALLEL:-4}"
+readonly LATENCY_PROBES="${LATENCY_PROBES:-3}"
+readonly LATENCY_MAX_ATTEMPTS="${LATENCY_MAX_ATTEMPTS:-0}"
 
 # IP 缓存变量
 _CACHED_IPV4=""
@@ -8515,17 +8519,90 @@ _get_available_outbounds() {
     printf '%s\n' "${outbounds[@]}"
 }
 
+# 延迟展示辅助函数
+_latency_color() {
+    local latency="$1"
+    local color="${G}"
+    if [[ "$latency" == "超时" ]]; then
+        color="${R}"
+    elif [[ "$latency" =~ ^[0-9]+$ ]]; then
+        if [[ "$latency" -gt 1000 ]]; then
+            color="${R}"
+        elif [[ "$latency" -gt 300 ]]; then
+            color="${Y}"
+        fi
+    fi
+    echo "$color"
+}
+
+_format_latency_badge() {
+    local latency="$1"
+    local color
+    color=$(_latency_color "$latency")
+    if [[ "$latency" == "超时" ]]; then
+        echo "[${color}超时${NC}]"
+    elif [[ "$latency" =~ ^[0-9]+$ ]]; then
+        echo "[${color}${latency}ms${NC}]"
+    else
+        echo ""
+    fi
+}
+
+# 配置地址展示 (支持 IPv6)
+_format_server_port() {
+    local server="$1"
+    local port="$2"
+    local display="$server"
+    
+    if [[ -z "$display" || "$display" == "-" ]]; then
+        echo "-"
+        return
+    fi
+    
+    display="${display#[}"
+    display="${display%]}"
+    [[ "$display" =~ : ]] && display="[$display]"
+    
+    if [[ -z "$port" || "$port" == "-" ]]; then
+        echo "${display}"
+    else
+        echo "${display}:${port}"
+    fi
+}
+
+# 显示排序后的延迟结果
+# 用法: _display_sorted_latencies "结果文件路径" [标记关联数组名]
+_display_sorted_latencies() {
+    local results="$1"
+    local marks_array_name="${2:-}"
+    [[ ! -f "$results" ]] && return
+    
+    sort -t'|' -k1 -n "$results" | while IFS='|' read -r _ latency name type server port; do
+        local latency_badge=$(_format_latency_badge "$latency")
+        local display_addr=$(_format_server_port "$server" "$port")
+        local mark_suffix=""
+
+        # 如果提供了标记数组名，尝试获取对应的标记
+        if [[ -n "$marks_array_name" ]]; then
+            eval "local mark_value=\"\${${marks_array_name}[${name}]}\""
+            [[ -n "$mark_value" ]] && mark_suffix=" ${Y}← ${mark_value}${NC}"
+        fi
+        
+        if [[ -n "$latency_badge" ]]; then
+            echo -e "  ${latency_badge} $name ${D}($type)${NC} ${D}${display_addr}${NC}${mark_suffix}"
+        fi
+    done
+}
+
 # 选择出口的交互函数 (带延迟检测)
 _select_outbound() {
     local prompt="${1:-选择出口}"
     local outbounds=()
     local display_names=()
-    local node_credentials=()  # 存储节点的用户名密码
     
     # 直连出口（优先级最高）
     outbounds+=("direct")
     display_names+=("DIRECT")
-    node_credentials+=("")
     
     # 获取节点完整信息
     local nodes=$(db_get_chain_nodes 2>/dev/null)
@@ -8536,10 +8613,9 @@ _select_outbound() {
     if [[ "$warp_st" == "configured" || "$warp_st" == "connected" ]]; then
         outbounds+=("warp")
         display_names+=("WARP")
-        node_credentials+=("")
     fi
     
-    # 链式代理节点 - 获取完整信息包括用户名密码
+    # 链式代理节点 - 获取完整信息
     if [[ "$node_count" -gt 0 ]]; then
         while IFS= read -r node_json; do
             [[ -z "$node_json" ]] && continue
@@ -8547,12 +8623,9 @@ _select_outbound() {
             local type=$(echo "$node_json" | jq -r '.type // ""')
             local server=$(echo "$node_json" | jq -r '.server // ""')
             local port=$(echo "$node_json" | jq -r '.port // ""')
-            local username=$(echo "$node_json" | jq -r '.username // ""')
-            local password=$(echo "$node_json" | jq -r '.password // ""')
             [[ -z "$name" ]] && continue
             outbounds+=("chain:${name}")
             display_names+=("${name}"$'\t'"${type}"$'\t'"${server}"$'\t'"${port}")
-            node_credentials+=("${username}"$'\t'"${password}")
         done < <(echo "$nodes" | jq -c '.[]')
     fi
     
@@ -8573,16 +8646,11 @@ _select_outbound() {
     local idx=0
     for i in "${!display_names[@]}"; do
         local info="${display_names[$i]}"
-        local creds="${node_credentials[$i]}"
         if [[ "$info" == "DIRECT" || "$info" == "WARP" ]]; then
             latency_results+=("-|$info|-")
         else
-            local node_type=$(echo "$info" | cut -d$'\t' -f2)
-            local server=$(echo "$info" | cut -d$'\t' -f3)
-            local port=$(echo "$info" | cut -d$'\t' -f4)
-            local username=$(echo "$creds" | cut -d$'\t' -f1)
-            local password=$(echo "$creds" | cut -d$'\t' -f2)
-            local result=$(check_node_latency "$server" "$port" "$node_type" "$username" "$password" 2>/dev/null)
+            local node_name=$(echo "$info" | cut -d$'\t' -f1)
+            local result=$(check_node_latency "$node_name" 2>/dev/null)
             latency_results+=("$result")
         fi
         ((idx++))
@@ -8595,7 +8663,7 @@ _select_outbound() {
     fi
     echo "" >&2
     
-    # 构建排序数据: latency_num|idx|latency_display|name|type|ip
+    # 构建排序数据: latency_num|idx|latency_display|name|type|server|port
     local sort_data=()
     for i in "${!outbounds[@]}"; do
         local info="${display_names[$i]}"
@@ -8603,44 +8671,39 @@ _select_outbound() {
         
         if [[ "$info" == "DIRECT" ]]; then
             # 直连放在最前面，排序值为 -1
-            sort_data+=("-1|$i|DIRECT|直连 (本机出口)|direct|-")
+            sort_data+=("-1|$i|DIRECT|直连 (本机出口)|direct|-|-")
         elif [[ "$info" == "WARP" ]]; then
-            sort_data+=("0|$i|WARP|WARP|warp|-")
+            sort_data+=("0|$i|WARP|WARP|warp|-|-")
         else
             # display_names 用 tab 分隔: name\ttype\tserver\tport
             local name=$(echo "$info" | cut -d$'\t' -f1)
             local type=$(echo "$info" | cut -d$'\t' -f2)
+            local server=$(echo "$info" | cut -d$'\t' -f3)
+            local port=$(echo "$info" | cut -d$'\t' -f4)
             local latency="${result%%|*}"
-            local resolved_ip="${result##*|}"
             
             local latency_num=99999
             [[ "$latency" =~ ^[0-9]+$ ]] && latency_num="$latency"
             
-            sort_data+=("${latency_num}|$i|${latency}|${name}|${type}|${resolved_ip}")
+            sort_data+=("${latency_num}|$i|${latency}|${name}|${type}|${server}|${port}")
         fi
     done
     
     # 按延迟排序并显示
     local sorted_indices=()
     local display_idx=1
-    while IFS='|' read -r latency_num orig_idx latency name type resolved_ip; do
+    while IFS='|' read -r latency_num orig_idx latency name type server port; do
         sorted_indices+=("$orig_idx")
         
-        local latency_color="${G}"
-        if [[ "$latency" == "超时" ]]; then
-            latency_color="${R}"
-        elif [[ "$latency" =~ ^[0-9]+$ && "$latency" -gt 300 ]]; then
-            latency_color="${Y}"
-        fi
+        local latency_badge=$(_format_latency_badge "$latency")
+        local display_addr=$(_format_server_port "$server" "$port")
         
         if [[ "$name" == "直连 (本机出口)" ]]; then
             echo -e "  ${G}${display_idx}${NC}) ${C}直连${NC} ${D}(本机 IP 出口)${NC}" >&2
         elif [[ "$name" == "WARP" ]]; then
             echo -e "  ${G}${display_idx}${NC}) WARP" >&2
-        elif [[ "$latency" == "超时" ]]; then
-            echo -e "  ${G}${display_idx}${NC}) [${latency_color}${latency}${NC}] ${name} ${D}(${type})${NC} ${D}${resolved_ip}${NC}" >&2
-        elif [[ "$latency" =~ ^[0-9]+$ ]]; then
-            echo -e "  ${G}${display_idx}${NC}) [${latency_color}${latency}ms${NC}] ${name} ${D}(${type})${NC} ${D}${resolved_ip}${NC}" >&2
+        elif [[ -n "$latency_badge" ]]; then
+            echo -e "  ${G}${display_idx}${NC}) ${latency_badge} ${name} ${D}(${type})${NC} ${D}${display_addr}${NC}" >&2
         else
             echo -e "  ${G}${display_idx}${NC}) ${name} ${D}(${type})${NC}" >&2
         fi
@@ -10702,13 +10765,236 @@ manage_routing() {
 # 链式代理转发
 #═══════════════════════════════════════════════════════════════════════════════
 
+# 节点类型支持判断
+_node_supports_xray() {
+    local type="$1"
+    case "$type" in
+        socks|http|shadowsocks|vmess|vless|trojan) return 0 ;;
+    esac
+    return 1
+}
+
+_node_supports_singbox() {
+    local type="$1"
+    case "$type" in
+        socks|http|shadowsocks|vmess|vless|trojan|hysteria2|tuic|naive) return 0 ;;
+    esac
+    return 1
+}
+
+_pick_latency_core() {
+    local type="$1"
+    if _node_supports_xray "$type" && check_cmd xray; then
+        echo "xray"
+        return 0
+    fi
+    if _node_supports_singbox "$type" && check_cmd sing-box; then
+        echo "singbox"
+        return 0
+    fi
+    return 1
+}
+
+_wait_local_port() {
+    local port="$1"
+    local retries=20
+    while [[ "$retries" -gt 0 ]]; do
+        if check_cmd nc; then
+            if nc -z 127.0.0.1 "$port" &>/dev/null; then
+                return 0
+            fi
+        elif timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/${port}" &>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+        ((retries--))
+    done
+    return 1
+}
+
+_core_latency_test() {
+    local core="$1" node_json="$2" ip_mode="${3:-prefer_ipv4}"
+    local tmp_dir cfg_file proxy_port outbound pid latency=""
+    
+    tmp_dir=$(mktemp -d) || return 1
+    cfg_file="${tmp_dir}/core.json"
+    proxy_port=$(gen_port)
+    
+    if [[ "$core" == "xray" ]]; then
+        outbound=$(gen_xray_chain_outbound "$node_json" "proxy" "$ip_mode")
+        if [[ -z "$outbound" ]]; then
+            rm -rf "$tmp_dir"
+            return 1
+        fi
+        cat > "$cfg_file" <<EOF
+{
+  "log": {"loglevel": "none"},
+  "inbounds": [
+    {"listen": "127.0.0.1", "port": $proxy_port, "protocol": "socks", "settings": {"udp": true}}
+  ],
+  "outbounds": [
+    $outbound
+  ]
+}
+EOF
+        xray run -c "$cfg_file" >/dev/null 2>&1 &
+        pid=$!
+    else
+        outbound=$(gen_singbox_chain_outbound "$node_json" "proxy" "$ip_mode")
+        if [[ -z "$outbound" ]]; then
+            rm -rf "$tmp_dir"
+            return 1
+        fi
+        cat > "$cfg_file" <<EOF
+{
+  "log": {"level": "error"},
+  "inbounds": [
+    {"type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": $proxy_port}
+  ],
+  "outbounds": [
+    $outbound
+  ],
+  "route": {"final": "proxy"}
+}
+EOF
+        sing-box run -c "$cfg_file" >/dev/null 2>&1 &
+        pid=$!
+    fi
+    
+    if [[ -z "$pid" ]]; then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    
+    if ! _wait_local_port "$proxy_port"; then
+        kill "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    
+    local -a samples=()
+    local probe_total=""
+    local probe_count="$LATENCY_PROBES"
+    local max_attempts="$LATENCY_MAX_ATTEMPTS"
+    [[ -z "$probe_count" || "$probe_count" -lt 1 ]] && probe_count=1
+    if [[ -z "$max_attempts" || "$max_attempts" -lt "$probe_count" ]]; then
+        max_attempts=$((probe_count * 2))
+    fi
+    
+    local attempts=0
+    while [[ "${#samples[@]}" -lt "$probe_count" && "$attempts" -lt "$max_attempts" ]]; do
+        ((attempts++))
+        if probe_total=$(curl -s -o /dev/null -w "%{time_total}" \
+            --connect-timeout "$CURL_TIMEOUT_FAST" \
+            --max-time "$CURL_TIMEOUT_NORMAL" \
+            --socks5-hostname "127.0.0.1:${proxy_port}" \
+            "$LATENCY_TEST_URL"); then
+            local ms=$(awk -v t="$probe_total" 'BEGIN {if (t ~ /^[0-9.]+$/) printf "%.0f", t*1000}')
+            [[ -n "$ms" ]] && samples+=("$ms")
+        fi
+    done
+    
+    if [[ "${#samples[@]}" -gt 0 ]]; then
+        local mid=$(( (${#samples[@]} + 1) / 2 ))
+        latency=$(printf '%s\n' "${samples[@]}" | sort -n | awk -v m="$mid" 'NR==m {print; exit}')
+    fi
+    
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    rm -rf "$tmp_dir"
+    
+    [[ -n "$latency" ]] && { echo "$latency"; return 0; }
+    return 1
+}
+
+# 批量节点测速（并发执行）
+# 用法: _batch_latency_nodes "结果文件" ["并发数"]
+# stdin: 每行节点 JSON
+_batch_latency_nodes() {
+    local results_file="$1"
+    local parallel="${2:-$LATENCY_PARALLEL}"
+    local tmp_dir
+    
+    [[ -z "$results_file" ]] && return 1
+    [[ -z "$parallel" || "$parallel" -lt 1 ]] && parallel=1
+    
+    tmp_dir=$(mktemp -d) || return 1
+    
+    local idx=0
+    local -a pids=()
+    while IFS= read -r node_json; do
+        [[ -z "$node_json" ]] && continue
+        local out_file="${tmp_dir}/${idx}"
+        (
+            if ! echo "$node_json" | jq empty 2>/dev/null; then
+                exit 0
+            fi
+            local name=$(echo "$node_json" | jq -r '.name // "未知"')
+            local type=$(echo "$node_json" | jq -r '.type // "?"')
+            local server=$(echo "$node_json" | jq -r '.server // ""')
+            local port=$(echo "$node_json" | jq -r '.port // ""')
+            port=$(echo "$port" | tr -d '"' | tr -d ' ')
+            [[ -z "$port" ]] && port="-"
+            [[ -z "$server" ]] && server="-"
+            local result=$(check_node_latency "$node_json")
+            local latency="${result%%|*}"
+            local latency_num=99999
+            [[ "$latency" =~ ^[0-9]+$ ]] && latency_num="$latency"
+            printf '%s|%s|%s|%s|%s|%s\n' "$latency_num" "$latency" "$name" "$type" "$server" "$port" > "$out_file"
+        ) &
+        pids+=("$!")
+        if [[ "${#pids[@]}" -ge "$parallel" ]]; then
+            wait "${pids[0]}" 2>/dev/null
+            pids=("${pids[@]:1}")
+        fi
+        ((idx++))
+    done
+    
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null
+    done
+    
+    if ls "$tmp_dir" >/dev/null 2>&1; then
+        cat "$tmp_dir"/* >> "$results_file"
+    fi
+    rm -rf "$tmp_dir"
+}
+
 # 检测节点延迟和解析 IP
-# 用法: check_node_latency "server" "port" ["proto"] ["username"] ["password"]
-# 返回: "延迟ms|出口IP" 或 "超时|-"
+# 用法: check_node_latency "节点名" 或 "节点JSON"
+# 返回: "延迟ms|解析IP" 或 "超时|-"
 check_node_latency() {
-    local server="$1" port="$2" proto="${3:-tcp}" username="${4:-}" password="${5:-}"
-    local resolved_ip="" latency=""
-    local is_ipv6=false
+    local node_ref="$1"
+    local node=""
+    local resolved_ip="" latency="" is_ipv6=false
+    
+    [[ -z "$node_ref" ]] && { echo "超时|-"; return; }
+    if [[ "$node_ref" =~ ^\{ ]]; then
+        node="$node_ref"
+    else
+        node=$(db_get_chain_node "$node_ref")
+    fi
+    
+    if [[ -z "$node" || "$node" == "null" ]] || ! echo "$node" | jq empty 2>/dev/null; then
+        echo "超时|-"
+        return
+    fi
+    
+    local type=$(echo "$node" | jq -r '
+        (.type // "") | 
+        if . == "socks5" then "socks"
+        elif . == "hy2" then "hysteria2"
+        else . end
+    ')
+    local server=$(echo "$node" | jq -r '.server // ""')
+    local port=$(echo "$node" | jq -r '.port // ""')
+    port=$(echo "$port" | tr -d '"' | tr -d ' ')
+    
+    if [[ -z "$type" || -z "$server" || ! "$port" =~ ^[0-9]+$ ]]; then
+        echo "超时|-"
+        return
+    fi
     
     # 移除 server 可能带有的方括号 (IPv6 格式)
     server="${server#[}"
@@ -10730,110 +11016,17 @@ check_node_latency() {
     fi
     [[ -z "$resolved_ip" ]] && resolved_ip="-"
     
-    local start_time end_time
-    start_time=$(date +%s%3N)
+    local core=""
+    core=$(_pick_latency_core "$type") || { echo "超时|$resolved_ip"; return; }
     
-    # SOCKS5 代理：通过代理发起 HTTP 请求测真实出口延迟和出口 IP
-    if [[ "$proto" == "socks" || "$proto" == "socks5" ]]; then
-        local proxy_url=""
-        local server_fmt="$server"
-        [[ "$is_ipv6" == "true" ]] && server_fmt="[$server]"
-        
-        if [[ -n "$username" && -n "$password" ]]; then
-            proxy_url="socks5h://${username}:${password}@${server_fmt}:${port}"
-        else
-            proxy_url="socks5h://${server_fmt}:${port}"
-        fi
-        
-        # 通过代理获取出口 IP 并测量延迟
-        local exit_ip
-        exit_ip=$(curl -x "$proxy_url" -s --connect-timeout 5 --max-time 10 "http://ip.sb" 2>/dev/null)
-        if [[ -n "$exit_ip" && "$exit_ip" =~ ^[0-9a-fA-F.:]+$ ]]; then
-            end_time=$(date +%s%3N)
-            latency=$((end_time - start_time))
-            echo "${latency}|${exit_ip}"
-        else
-            echo "超时|-"
-        fi
-        return
-    fi
+    local ip_mode="prefer_ipv4"
+    [[ "$is_ipv6" == "true" ]] && ip_mode="prefer_ipv6"
     
-    # HTTP 代理：通过代理发起 HTTP 请求测真实出口延迟和出口 IP
-    if [[ "$proto" == "http" ]]; then
-        local proxy_url=""
-        local server_fmt="$server"
-        [[ "$is_ipv6" == "true" ]] && server_fmt="[$server]"
-        
-        if [[ -n "$username" && -n "$password" ]]; then
-            proxy_url="http://${username}:${password}@${server_fmt}:${port}"
-        else
-            proxy_url="http://${server_fmt}:${port}"
-        fi
-        
-        local exit_ip
-        exit_ip=$(curl -x "$proxy_url" -s --connect-timeout 5 --max-time 10 "http://ip.sb" 2>/dev/null)
-        if [[ -n "$exit_ip" && "$exit_ip" =~ ^[0-9a-fA-F.:]+$ ]]; then
-            end_time=$(date +%s%3N)
-            latency=$((end_time - start_time))
-            echo "${latency}|${exit_ip}"
-        else
-            echo "超时|-"
-        fi
-        return
-    fi
-    
-    # UDP 协议 (hy2/tuic) 使用 ICMP ping
-    if [[ "$proto" == "hysteria2" || "$proto" == "hy2" || "$proto" == "tuic" ]]; then
-        local ping_target="$server"
-        [[ "$resolved_ip" != "-" ]] && ping_target="$resolved_ip"
-        
-        if [[ "$is_ipv6" == "true" ]]; then
-            if command -v ping6 &>/dev/null; then
-                if ping6 -c 1 -W 2 "$ping_target" &>/dev/null; then
-                    end_time=$(date +%s%3N)
-                    latency=$((end_time - start_time))
-                else
-                    latency="超时"
-                fi
-            elif ping -6 -c 1 -W 2 "$ping_target" &>/dev/null; then
-                end_time=$(date +%s%3N)
-                latency=$((end_time - start_time))
-            else
-                latency="超时"
-            fi
-        else
-            if ping -c 1 -W 2 "$ping_target" &>/dev/null; then
-                end_time=$(date +%s%3N)
-                latency=$((end_time - start_time))
-            else
-                latency="超时"
-            fi
-        fi
+    if latency=$(_core_latency_test "$core" "$node" "$ip_mode"); then
         echo "${latency}|${resolved_ip}"
-        return
-    fi
-    
-    # 其他 TCP 协议使用 TCP 连接测试
-    local connect_addr="$server"
-    if [[ "$is_ipv6" == "true" || "$server" =~ : ]]; then
-        connect_addr="[$server]"
-    fi
-    
-    if command -v nc &>/dev/null; then
-        if timeout 3 nc -z -w 2 "$server" "$port" 2>/dev/null; then
-            end_time=$(date +%s%3N)
-            latency=$((end_time - start_time))
-        else
-            latency="超时"
-        fi
-    elif timeout 3 bash -c "echo >/dev/tcp/${connect_addr}/$port" 2>/dev/null; then
-        end_time=$(date +%s%3N)
-        latency=$((end_time - start_time))
     else
-        latency="超时"
+        echo "超时|${resolved_ip}"
     fi
-    
-    echo "${latency}|${resolved_ip}"
 }
 
 # 数据库：链式代理节点操作
@@ -11231,17 +11424,22 @@ parse_subscription() {
     _ok "解析到 $count 个节点"
 }
 
-# 生成 Xray 链式代理 outbound (支持指定节点名和自定义 tag)
-# 用法: gen_xray_chain_outbound [节点名] [tag] [ip_mode]
+# 生成 Xray 链式代理 outbound (支持指定节点名/节点JSON和自定义 tag)
+# 用法: gen_xray_chain_outbound [节点名|节点JSON] [tag] [ip_mode]
 # 第三个参数 ip_mode: ipv4_only, ipv6_only, prefer_ipv4 (默认), prefer_ipv6
 gen_xray_chain_outbound() {
-    local node_name="${1:-$(db_get_chain_active)}"
+    local node_ref="${1:-$(db_get_chain_active)}"
     local tag="${2:-chain}"
     local ip_mode="${3:-prefer_ipv4}"  # 第三个参数，默认 prefer_ipv4
-    [[ -z "$node_name" ]] && return
+    [[ -z "$node_ref" ]] && return
     
-    local node=$(db_get_chain_node "$node_name")
-    [[ -z "$node" ]] && return
+    local node=""
+    if [[ "$node_ref" =~ ^\{ ]]; then
+        node="$node_ref"
+    else
+        node=$(db_get_chain_node "$node_ref")
+    fi
+    [[ -z "$node" || "$node" == "null" ]] && return
     
     local type=$(echo "$node" | jq -r '.type')
     local server=$(echo "$node" | jq -r '.server')
@@ -11407,17 +11605,22 @@ gen_xray_chain_outbound() {
     esac
 }
 
-# 生成 Sing-box 链式代理 outbound (支持指定节点名和自定义 tag)
-# 用法: gen_singbox_chain_outbound [节点名] [tag] [ip_mode]
+# 生成 Sing-box 链式代理 outbound (支持指定节点名/节点JSON和自定义 tag)
+# 用法: gen_singbox_chain_outbound [节点名|节点JSON] [tag] [ip_mode]
 # 第三个参数 ip_mode: ipv4_only, ipv6_only, prefer_ipv4 (默认), prefer_ipv6
 gen_singbox_chain_outbound() {
-    local node_name="${1:-$(db_get_chain_active)}"
+    local node_ref="${1:-$(db_get_chain_active)}"
     local tag="${2:-chain}"
     local ip_mode="${3:-prefer_ipv4}"  # 第三个参数，默认 prefer_ipv4
-    [[ -z "$node_name" ]] && return
+    [[ -z "$node_ref" ]] && return
     
-    local node=$(db_get_chain_node "$node_name")
-    [[ -z "$node" ]] && return
+    local node=""
+    if [[ "$node_ref" =~ ^\{ ]]; then
+        node="$node_ref"
+    else
+        node=$(db_get_chain_node "$node_ref")
+    fi
+    [[ -z "$node" || "$node" == "null" ]] && return
     
     local type=$(echo "$node" | jq -r '.type')
     local server=$(echo "$node" | jq -r '.server')
@@ -11674,7 +11877,7 @@ _import_subscription_interactive() {
     
     # 预览阶段：检测延迟并显示 (复用测试延迟的逻辑)
     echo ""
-    echo -e "  ${C}▸${NC} 检测节点延迟中..."
+    echo -e "  ${C}▸${NC} 检测节点延迟中... (并发 ${LATENCY_PARALLEL})"
     
     local tmp_results=$(mktemp)
     local tmp_nodes=$(mktemp)
@@ -11687,46 +11890,20 @@ _import_subscription_interactive() {
         fi
         ((i++))
         
-        local name=$(echo "$node" | jq -r '.name // "未知"' 2>/dev/null)
-        local type=$(echo "$node" | jq -r '.type // "?"' 2>/dev/null)
-        local server=$(echo "$node" | jq -r '.server // "?"' 2>/dev/null)
-        local port=$(echo "$node" | jq -r '.port // 443' 2>/dev/null)
-        
-        # 检测延迟
-        local result=$(check_node_latency "$server" "$port" "$type")
-        local latency="${result%%|*}"
-        local resolved_ip="${result##*|}"
-        local latency_num=99999
-        [[ "$latency" =~ ^[0-9]+$ ]] && latency_num="$latency"
-        
-        # 保存结果用于排序显示
-        echo "${latency_num}|${latency}|${name}|${type}|${resolved_ip}" >> "$tmp_results"
-        # 保存原始节点 JSON 用于后续导入
+        # 保存原始节点 JSON 用于后续导入与批量测速
         echo "$node" >> "$tmp_nodes"
         
         printf "\r  ${C}▸${NC} 检测中... (%d/%d)  " "$i" "$total_count" >&2
     done <<< "$parsed_nodes"
     
-    echo ""
+    echo "" >&2
+    _batch_latency_nodes "$tmp_results" "$LATENCY_PARALLEL" < "$tmp_nodes"
+    
     echo ""
     echo -e "  ${W}节点列表 (按延迟排序):${NC}"
     _line
     
-    # 按延迟排序显示
-    sort -t'|' -k1 -n "$tmp_results" | while IFS='|' read -r _ latency name type resolved_ip; do
-        local latency_color="${G}"
-        local display_name="$name"
-        [[ ${#display_name} -gt 28 ]] && display_name="${display_name:0:25}..."
-        
-        if [[ "$latency" == "超时" ]]; then
-            latency_color="${R}"
-            echo -e "  [${latency_color}超时${NC}] $display_name ${D}($type)${NC} ${D}${resolved_ip}${NC}"
-        elif [[ "$latency" =~ ^[0-9]+$ ]]; then
-            [[ "$latency" -gt 300 ]] && latency_color="${Y}"
-            [[ "$latency" -gt 1000 ]] && latency_color="${R}"
-            echo -e "  [${latency_color}${latency}ms${NC}] $display_name ${D}($type)${NC} ${D}${resolved_ip}${NC}"
-        fi
-    done
+    _display_sorted_latencies "$tmp_results"
     
     _line
     
@@ -11973,57 +12150,21 @@ manage_chain_proxy() {
                     done < <(echo "$routing_rules" | jq -r '.[] | "\(.type)|\(.outbound)"')
                 fi
                 
-                echo -e "  ${C}▸${NC} 检测 $count 个节点延迟中..."
+                echo -e "  ${C}▸${NC} 检测 $count 个节点延迟中... (并发 ${LATENCY_PARALLEL})"
                 
-                # 先收集所有节点信息到临时文件
                 local tmp_results=$(mktemp)
-                local i=0
-                # 遍历节点，获取完整信息（包括用户名密码）
-                while IFS= read -r node_json; do
-                    [[ -z "$node_json" ]] && continue
-                    local name=$(echo "$node_json" | jq -r '.name // ""')
-                    local type=$(echo "$node_json" | jq -r '.type // ""')
-                    local server=$(echo "$node_json" | jq -r '.server // ""')
-                    local port=$(echo "$node_json" | jq -r '.port // ""')
-                    local username=$(echo "$node_json" | jq -r '.username // ""')
-                    local password=$(echo "$node_json" | jq -r '.password // ""')
-                    [[ -z "$server" ]] && continue
-                    
-                    local result=$(check_node_latency "$server" "$port" "$type" "$username" "$password")
-                    local latency="${result%%|*}"
-                    local resolved_ip="${result##*|}"
-                    local latency_num=99999
-                    [[ "$latency" =~ ^[0-9]+$ ]] && latency_num="$latency"
-                    echo "${latency_num}|${latency}|${name}|${type}|${resolved_ip}" >> "$tmp_results"
-                    ((i++))
-                    printf "\r  ${C}▸${NC} 检测中... (%d/%d)  " "$i" "$count" >&2
-                done < <(echo "$nodes" | jq -c '.[]')
+                local tmp_nodes=$(mktemp)
+                echo "$nodes" | jq -c '.[]' > "$tmp_nodes"
+                _batch_latency_nodes "$tmp_results" "$LATENCY_PARALLEL" < "$tmp_nodes"
                 
-                echo ""
                 _ok "延迟检测完成 ($count 个节点)"
                 echo ""
                 echo -e "  ${W}延迟排序 (从低到高):${NC}"
                 _line
                 
-                # 排序并显示
-                sort -t'|' -k1 -n "$tmp_results" | while IFS='|' read -r _ latency name type resolved_ip; do
-                    local latency_color="${G}"
-                    local mark=""
-                    # 显示分流规则标记
-                    if [[ -n "${routing_marks[$name]}" ]]; then
-                        mark=" ${Y}← ${routing_marks[$name]}${NC}"
-                    fi
-                    
-                    if [[ "$latency" == "超时" ]]; then
-                        latency_color="${R}"
-                        echo -e "  [${latency_color}${latency}${NC}] $name ${D}($type)${NC} ${D}${resolved_ip}${NC}$mark"
-                    elif [[ "$latency" =~ ^[0-9]+$ ]]; then
-                        [[ "$latency" -gt 300 ]] && latency_color="${Y}"
-                        echo -e "  [${latency_color}${latency}ms${NC}] $name ${D}($type)${NC} ${D}${resolved_ip}${NC}$mark"
-                    fi
-                done
+                _display_sorted_latencies "$tmp_results" "routing_marks"
                 
-                rm -f "$tmp_results"
+                rm -f "$tmp_results" "$tmp_nodes"
                 _line
                 _pause
                 ;;
