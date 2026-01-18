@@ -77,7 +77,8 @@ init_db() {
 _db_touch() {
     [[ -f "$DB_FILE" ]] || init_db || return 1
     local now tmp
-    now=$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')
+    # Alpine busybox date 不支持 -Iseconds，使用兼容格式
+    now=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')
     tmp=$(mktemp) || return 1
     if jq --arg t "$now" '.meta.updated=$t' "$DB_FILE" >"$tmp"; then
         mv "$tmp" "$DB_FILE"
@@ -115,16 +116,151 @@ db_add() { # db_add core proto json
 }
 
 
-# 从数据库获取协议配置
+# 获取协议配置（支持多端口实例）
+# 参数: $1=core(xray/singbox), $2=protocol
+# 返回: JSON配置（数组或单个对象）
 db_get() {
+    local core="$1" protocol="$2"
     [[ ! -f "$DB_FILE" ]] && return 1
-    jq -r --arg p "$2" ".${1}[\$p] // empty" "$DB_FILE" 2>/dev/null
+
+    local config=$(jq -r --arg c "$core" --arg p "$protocol" \
+        '.[$c][$p] // empty' "$DB_FILE" 2>/dev/null)
+
+    [[ -z "$config" ]] && return 1
+
+    # 直接返回配置（可能是数组或单个对象）
+    echo "$config"
 }
 
 # 从数据库获取协议的某个字段
 db_get_field() {
     [[ ! -f "$DB_FILE" ]] && return 1
     jq -r --arg p "$2" --arg f "$3" ".${1}[\$p][\$f] // empty" "$DB_FILE" 2>/dev/null
+}
+
+# 列出协议的所有端口实例
+# 参数: $1=core(xray/singbox), $2=protocol
+# 返回: 端口列表，每行一个端口号
+db_list_ports() {
+    local core="$1" protocol="$2"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    local config=$(jq -r --arg c "$core" --arg p "$protocol" \
+        '.[$c][$p] // empty' "$DB_FILE" 2>/dev/null)
+    
+    [[ -z "$config" ]] && return 1
+    
+    # 检查是否为数组
+    if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        echo "$config" | jq -r '.[].port'
+    else
+        # 兼容旧格式（单个对象）
+        echo "$config" | jq -r '.port // empty'
+    fi
+}
+
+# 获取指定端口的配置
+# 参数: $1=core, $2=protocol, $3=port
+# 返回: JSON配置对象
+db_get_port_config() {
+    local core="$1" protocol="$2" port="$3"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    local config=$(jq -r --arg c "$core" --arg p "$protocol" \
+        '.[$c][$p] // empty' "$DB_FILE" 2>/dev/null)
+    
+    [[ -z "$config" ]] && return 1
+    
+    if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        echo "$config" | jq --arg port "$port" '.[] | select(.port == ($port | tonumber))'
+    else
+        # 兼容旧格式
+        local existing_port=$(echo "$config" | jq -r '.port')
+        [[ "$existing_port" == "$port" ]] && echo "$config"
+    fi
+}
+
+# 添加端口实例到协议
+# 参数: $1=core, $2=protocol, $3=port_config_json
+db_add_port() {
+    local core="$1" protocol="$2" port_config="$3"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    # 提取要添加的端口号
+    local new_port=$(echo "$port_config" | jq -r '.port')
+    
+    # 检查端口是否已存在
+    local existing_ports=$(db_list_ports "$core" "$protocol")
+    if echo "$existing_ports" | grep -q "^${new_port}$"; then
+        echo -e "${YELLOW}警告: 端口 $new_port 已存在于协议 $protocol 中，跳过添加${NC}" >&2
+        return 0
+    fi
+    
+    local tmp_file="${DB_FILE}.tmp"
+    
+    jq --arg c "$core" --arg p "$protocol" --argjson cfg "$port_config" '
+        .[$c][$p] = (
+            if .[$c][$p] then
+                if (.[$c][$p] | type) == "array" then
+                    .[$c][$p] + [$cfg]
+                else
+                    [.[$c][$p], $cfg]
+                end
+            else
+                [$cfg]
+            end
+        )
+    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+}
+
+# 删除指定端口实例
+# 参数: $1=core, $2=protocol, $3=port
+db_remove_port() {
+    local core="$1" protocol="$2" port="$3"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    local tmp_file="${DB_FILE}.tmp"
+    
+    jq --arg c "$core" --arg p "$protocol" --arg port "$port" '
+        .[$c][$p] = (
+            if (.[$c][$p] | type) == "array" then
+                .[$c][$p] | map(select(.port != ($port | tonumber)))
+            else
+                if .[$c][$p].port == ($port | tonumber) then
+                    null
+                else
+                    .[$c][$p]
+                end
+            end
+        ) | if .[$c][$p] == [] or .[$c][$p] == null then
+            del(.[$c][$p])
+        else
+            .
+        end
+    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+}
+
+# 更新指定端口的配置
+# 参数: $1=core, $2=protocol, $3=port, $4=new_config_json
+db_update_port() {
+    local core="$1" protocol="$2" port="$3" new_config="$4"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    local tmp_file="${DB_FILE}.tmp"
+    
+    jq --arg c "$core" --arg p "$protocol" --arg port "$port" --argjson cfg "$new_config" '
+        .[$c][$p] = (
+            if (.[$c][$p] | type) == "array" then
+                .[$c][$p] | map(if .port == ($port | tonumber) then $cfg else . end)
+            else
+                if .[$c][$p].port == ($port | tonumber) then
+                    $cfg
+                else
+                    .[$c][$p]
+                end
+            end
+        )
+    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
 }
 
 # 删除协议
@@ -509,28 +645,38 @@ declare -A SVC_PROC=(
     [nginx]="nginx"
 )
 
-# 协议注册和状态管理 (重构版 - 只使用数据库)
+# 注册协议配置到数据库
+# 参数: $1=protocol, $2=config_json
 register_protocol() {
-    local protocol=$1
-    local config_json="${2:-}"  # JSON 配置 (必需)
+    local protocol="$1"
+    local config_json="$2"
     
-    mkdir -p "$CFG"
-    
-    # 写入数据库
-    if [[ -n "$config_json" ]]; then
-        local core="xray"
-        # 判断协议归属的核心 (使用空格包裹进行精确匹配，修复 grep -w 将连字符视为边界的问题)
-        if [[ " $SINGBOX_PROTOCOLS " == *" $protocol "* ]]; then
-            core="singbox"
-        elif [[ " $STANDALONE_PROTOCOLS " == *" $protocol "* ]]; then
-            core="singbox"  # 独立协议也记录到 singbox 分类
-        fi
-        
-        if ! db_add "$core" "$protocol" "$config_json"; then
-            _err "register_protocol: 写入数据库失败 - $protocol ($core)"
-            return 1
-        fi
+    # 确定核心类型
+    local core="xray"
+    if [[ " $SINGBOX_PROTOCOLS " == *" $protocol "* ]]; then
+        core="singbox"
     fi
+    
+    # 获取端口
+    local port
+    port=$(echo "$config_json" | jq -r '.port')
+    
+    # 根据安装模式处理
+    if [[ "$INSTALL_MODE" == "replace" && -n "$REPLACE_PORT" ]]; then
+        # 覆盖模式：更新指定端口的配置
+        echo -e "${CYAN}覆盖端口 $REPLACE_PORT 的配置...${NC}"
+        db_update_port "$core" "$protocol" "$REPLACE_PORT" "$config_json"
+    elif [[ "$INSTALL_MODE" == "add" ]] || is_protocol_installed "$protocol"; then
+        # 添加模式：添加新端口实例
+        echo -e "${CYAN}添加新端口 $port 实例...${NC}"
+        db_add_port "$core" "$protocol" "$config_json"
+    else
+        # 首次安装：使用原有逻辑
+        db_add "$core" "$protocol" "$config_json"
+    fi
+    
+    # 重置安装模式变量
+    unset INSTALL_MODE REPLACE_PORT
 }
 
 unregister_protocol() {
@@ -906,11 +1052,49 @@ generate_xray_config() {
     local failed_protocols=""
     local p
     for p in $xray_protocols; do
-        if add_xray_inbound_v2 "$p"; then
-            ((success_count++))
+        # 获取协议配置
+        local cfg=$(db_get "xray" "$p")
+
+        # 检查是否为多端口数组
+        if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            # 多端口模式：为每个端口创建临时单端口配置
+            local port_count=$(echo "$cfg" | jq 'length')
+            local i=0
+            local port_success=0
+
+            while [[ $i -lt $port_count ]]; do
+                local single_cfg=$(echo "$cfg" | jq ".[$i]")
+                local port=$(echo "$single_cfg" | jq -r '.port')
+
+                # 临时存储单端口配置
+                local tmp_protocol="${p}_port_${port}"
+                db_add "xray" "$tmp_protocol" "$single_cfg"
+
+                # 调用原有函数处理
+                if add_xray_inbound_v2 "$tmp_protocol"; then
+                    ((port_success++))
+                fi
+
+                # 清理临时配置
+                db_del "xray" "$tmp_protocol"
+
+                ((i++))
+            done
+
+            if [[ $port_success -gt 0 ]]; then
+                ((success_count++))
+            else
+                _warn "协议 $p 配置生成失败，跳过"
+                failed_protocols+="$p "
+            fi
         else
-            _warn "协议 $p 配置生成失败，跳过"
-            failed_protocols+="$p "
+            # 单端口模式：使用原有逻辑
+            if add_xray_inbound_v2 "$p"; then
+                ((success_count++))
+            else
+                _warn "协议 $p 配置生成失败，跳过"
+                failed_protocols+="$p "
+            fi
         fi
     done
     
@@ -941,6 +1125,21 @@ generate_xray_config() {
     return 0
 }
 
+# 处理单个端口实例的 inbound 生成
+# 参数: $1=protocol, $2=config_json
+_add_single_xray_inbound() {
+    local protocol="$1"
+    local cfg="$2"
+    
+    # 从配置中提取字段
+    local port=$(echo "$cfg" | jq -r '.port // empty')
+    [[ -z "$port" ]] && return 1
+    
+    # 调用原有的 inbound 生成逻辑
+    # 这里暂时返回成功，后续会补充完整逻辑
+    return 0
+}
+
 # 使用 jq 动态构建 inbound (重构版 - 只从数据库读取)
 add_xray_inbound_v2() {
     local protocol=$1
@@ -956,6 +1155,12 @@ add_xray_inbound_v2() {
     
     [[ -z "$cfg" ]] && { _err "协议 $protocol 配置为空"; return 1; }
     
+    # 提取基础协议名（去掉 _port_xxx 后缀）
+    local base_protocol="$protocol"
+    if [[ "$protocol" =~ ^(.+)_port_[0-9]+$ ]]; then
+        base_protocol="${BASH_REMATCH[1]}"
+    fi
+    
     # 从配置中提取字段
     local port=$(echo "$cfg" | jq -r '.port // empty')
     local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
@@ -968,6 +1173,9 @@ add_xray_inbound_v2() {
     local method=$(echo "$cfg" | jq -r '.method // empty')
     
     [[ -z "$port" ]] && return 1
+
+    # 生成唯一的 inbound tag（基础协议名 + 端口）
+    local inbound_tag="${base_protocol}-${port}"
     
     # 检测主协议和回落配置
     local has_master=false
@@ -1016,7 +1224,7 @@ add_xray_inbound_v2() {
         _ensure_nginx_https_for_reality "$cert_domain"
     fi
     
-    case "$protocol" in
+    case "$base_protocol" in
         vless)
             # VLESS+Reality - 使用 jq 安全构建
             jq -n \
@@ -1027,6 +1235,7 @@ add_xray_inbound_v2() {
                 --arg short_id "$short_id" \
                 --arg dest "$reality_dest" \
                 --arg listen_addr "$listen_addr" \
+                --arg tag "$inbound_tag" \
             '{
                 port: $port,
                 listen: $listen_addr,
@@ -1048,7 +1257,7 @@ add_xray_inbound_v2() {
                     }
                 },
                 sniffing: {enabled: true, destOverride: ["http","tls"]},
-                tag: "vless-reality"
+                tag: $tag
             }' > "$tmp_inbound"
             ;;
         vless-vision)
@@ -1058,6 +1267,7 @@ add_xray_inbound_v2() {
                 --arg uuid "$uuid" \
                 --arg cert "$CFG/certs/server.crt" \
                 --arg key "$CFG/certs/server.key" \
+                --arg tag "$inbound_tag" \
                 --argjson fallbacks "$fallbacks" \
                 --arg listen_addr "$listen_addr" \
             '{
@@ -1079,7 +1289,7 @@ add_xray_inbound_v2() {
                         certificates: [{certificateFile: $cert, keyFile: $key}]
                     }
                 },
-                tag: "vless-vision"
+                tag: $tag
             }' > "$tmp_inbound"
             ;;
         vless-ws)
@@ -1090,6 +1300,7 @@ add_xray_inbound_v2() {
                     --arg uuid "$uuid" \
                     --arg path "$path" \
                     --arg sni "$sni" \
+                    --arg tag "$inbound_tag" \
                 '{
                     port: $port,
                     listen: "127.0.0.1",
@@ -1101,7 +1312,7 @@ add_xray_inbound_v2() {
                         wsSettings: {path: $path, headers: {Host: $sni}}
                     },
                     sniffing: {enabled: true, destOverride: ["http","tls"]},
-                    tag: "vless-ws"
+                    tag: $tag
                 }' > "$tmp_inbound"
             else
                 # 独立模式：监听公网
@@ -1113,6 +1324,7 @@ add_xray_inbound_v2() {
                     --arg cert "$CFG/certs/server.crt" \
                     --arg key "$CFG/certs/server.key" \
                     --arg listen_addr "$listen_addr" \
+                    --arg tag "$inbound_tag" \
                 '{
                     port: $port,
                     listen: $listen_addr,
@@ -1129,7 +1341,7 @@ add_xray_inbound_v2() {
                         wsSettings: {path: $path, headers: {Host: $sni}}
                     },
                     sniffing: {enabled: true, destOverride: ["http","tls"]},
-                    tag: "vless-ws"
+                    tag: $tag
                 }' > "$tmp_inbound"
             fi
             ;;
@@ -1143,6 +1355,7 @@ add_xray_inbound_v2() {
                 --arg short_id "$short_id" \
                 --arg dest "$reality_dest" \
                 --arg listen_addr "$listen_addr" \
+                --arg tag "$inbound_tag" \
             '{
                 port: $port,
                 listen: $listen_addr,
@@ -1162,7 +1375,7 @@ add_xray_inbound_v2() {
                     }
                 },
                 sniffing: {enabled: true, destOverride: ["http","tls"]},
-                tag: "vless-xhttp"
+                tag: $tag
             }' > "$tmp_inbound"
             ;;
         vmess-ws)
@@ -1172,6 +1385,7 @@ add_xray_inbound_v2() {
                     --arg uuid "$uuid" \
                     --arg path "$path" \
                     --arg sni "$sni" \
+                    --arg tag "$inbound_tag" \
                 '{
                     port: $port,
                     listen: "127.0.0.1",
@@ -1182,7 +1396,7 @@ add_xray_inbound_v2() {
                         security: "none",
                         wsSettings: {path: $path, headers: {Host: $sni}}
                     },
-                    tag: "vmess-ws"
+                    tag: $tag
                 }' > "$tmp_inbound"
             else
                 jq -n \
@@ -1193,6 +1407,7 @@ add_xray_inbound_v2() {
                     --arg cert "$CFG/certs/server.crt" \
                     --arg key "$CFG/certs/server.key" \
                     --arg listen_addr "$listen_addr" \
+                    --arg tag "$inbound_tag" \
                 '{
                     port: $port,
                     listen: $listen_addr,
@@ -1207,7 +1422,7 @@ add_xray_inbound_v2() {
                         },
                         wsSettings: {path: $path, headers: {Host: $sni}}
                     },
-                    tag: "vmess-ws"
+                    tag: $tag
                 }' > "$tmp_inbound"
             fi
             ;;
@@ -1218,6 +1433,7 @@ add_xray_inbound_v2() {
                 --arg cert "$CFG/certs/server.crt" \
                 --arg key "$CFG/certs/server.key" \
                 --argjson fallbacks "$fallbacks" \
+                --arg tag "$inbound_tag" \
                 --arg listen_addr "$listen_addr" \
             '{
                 port: $port,
@@ -1232,7 +1448,7 @@ add_xray_inbound_v2() {
                     security: "tls",
                     tlsSettings: {certificates: [{certificateFile: $cert, keyFile: $key}]}
                 },
-                tag: "trojan"
+                tag: $tag
             }' > "$tmp_inbound"
             ;;
         socks)
@@ -1247,6 +1463,7 @@ add_xray_inbound_v2() {
                     --arg password "$password" \
                     --arg cert "$CFG/certs/server.crt" \
                     --arg key "$CFG/certs/server.key" \
+                    --arg tag "$inbound_tag" \
                     --arg listen_addr "$listen_addr" \
                 '{
                     port: $port,
@@ -1265,7 +1482,7 @@ add_xray_inbound_v2() {
                             certificates: [{certificateFile: $cert, keyFile: $key}]
                         }
                     },
-                    tag: "socks5"
+                    tag: $tag
                 }' > "$tmp_inbound"
             else
                 # SOCKS5 无 TLS
@@ -1273,6 +1490,7 @@ add_xray_inbound_v2() {
                     --argjson port "$port" \
                     --arg username "$username" \
                     --arg password "$password" \
+                    --arg tag "$inbound_tag" \
                     --arg listen_addr "$listen_addr" \
                 '{
                     port: $port,
@@ -1284,7 +1502,7 @@ add_xray_inbound_v2() {
                         udp: true,
                         ip: $listen_addr
                     },
-                    tag: "socks5"
+                    tag: $tag
                 }' > "$tmp_inbound"
             fi
             ;;
@@ -1293,7 +1511,7 @@ add_xray_inbound_v2() {
                 --argjson port "$port" \
                 --arg method "$method" \
                 --arg password "$password" \
-                --arg tag "$protocol" \
+                --arg tag "$inbound_tag" \
                 --arg listen_addr "$listen_addr" \
             '{
                 port: $port,
@@ -1821,6 +2039,12 @@ gen_port() {
 recommend_port() {
     local protocol="$1"
     
+    # 覆盖模式：优先推荐被覆盖的端口
+    if [[ "$INSTALL_MODE" == "replace" && -n "$REPLACE_PORT" ]]; then
+        echo "$REPLACE_PORT"
+        return 0
+    fi
+    
     # 检查是否已安装主协议（Vision/Trojan/Reality），用于判断 WS 协议是否为回落子协议
     local has_master=false
     if db_exists "xray" "vless-vision" || db_exists "xray" "vless" || db_exists "xray" "trojan"; then
@@ -1900,7 +2124,11 @@ ask_port() {
                 if [[ -n "$owner_443" ]]; then
                     echo -e "  ${Y}注意: 443 端口已被 [$owner_443] 协议占用${NC}" >&2
                 fi
-                echo -e "  ${C}建议: ${G}$recommend${NC} (已自动避开冲突)" >&2
+                if [[ "$INSTALL_MODE" == "replace" ]]; then
+                    echo -e "  ${C}建议: ${G}$recommend${NC}" >&2
+                else
+                    echo -e "  ${C}建议: ${G}$recommend${NC} (已自动避开冲突)" >&2
+                fi
             fi
             ;;
         vless|vless-xhttp|vless-vision|trojan)
@@ -1911,7 +2139,11 @@ ask_port() {
                 if [[ -n "$owner_443" ]]; then
                     echo -e "  ${Y}注意: 443 端口已被 [$owner_443] 协议占用${NC}" >&2
                 fi
-                echo -e "  ${C}建议: ${G}$recommend${NC} (已自动避开冲突)" >&2
+                if [[ "$INSTALL_MODE" == "replace" ]]; then
+                    echo -e "  ${C}建议: ${G}$recommend${NC}" >&2
+                else
+                    echo -e "  ${C}建议: ${G}$recommend${NC} (已自动避开冲突)" >&2
+                fi
             fi
             ;;
         *)
@@ -1945,16 +2177,50 @@ ask_port() {
             fi
         fi
         
-        # 1. 检查是否被脚本内部其他协议占用 (最重要的一步！)
-        local conflict_proto=$(is_internal_port_occupied "$custom_port")
-        if [[ -n "$conflict_proto" ]]; then
-            _err "端口 $custom_port 已被已安装的 [$conflict_proto] 占用！" >&2
-            _warn "不同协议不能共用同一端口，请更换其他端口。" >&2
-            continue # 跳过本次循环，让用户重输
+        # 确定当前协议的核心类型
+        local current_core="xray"
+        if [[ " $SINGBOX_PROTOCOLS " == *" $protocol "* ]]; then
+            current_core="singbox"
+        fi
+        
+        # 检查端口冲突（跨协议检测）
+        if ! check_port_conflict "$custom_port" "$protocol" "$current_core"; then
+            continue  # 端口冲突，重新输入
+        fi
+        
+        # 检查同协议端口占用
+        if [[ "$INSTALL_MODE" == "replace" ]]; then
+            # 覆盖模式：只允许使用被覆盖的端口或未占用的端口
+            local existing_ports=$(db_list_ports "$current_core" "$protocol" 2>/dev/null)
+            if echo "$existing_ports" | grep -q "^${custom_port}$"; then
+                # 端口已被该协议使用
+                if [[ "$custom_port" != "$REPLACE_PORT" ]]; then
+                    # 不是被覆盖的端口，拒绝
+                    echo -e "${RED}错误: 协议 $protocol 已在端口 $custom_port 上运行${NC}"
+                    echo -e "${YELLOW}提示: 覆盖模式下只能使用被覆盖的端口 $REPLACE_PORT 或其他未占用端口${NC}"
+                    continue
+                fi
+                # 是被覆盖的端口，允许继续
+            fi
+        else
+            # 添加/首次安装模式：不允许使用任何已占用端口
+            local existing_ports=$(db_list_ports "$current_core" "$protocol" 2>/dev/null)
+            if echo "$existing_ports" | grep -q "^${custom_port}$"; then
+                echo -e "${RED}错误: 协议 $protocol 已在端口 $custom_port 上运行${NC}"
+                echo -e "${YELLOW}提示: 请选择其他端口或返回主菜单选择覆盖模式${NC}"
+                continue
+            fi
         fi
         
         # 2. 检查系统端口占用 (Nginx 等外部程序)
         if ss -tuln 2>/dev/null | grep -q ":$custom_port " || netstat -tuln 2>/dev/null | grep -q ":$custom_port "; then
+            # 覆盖模式：如果是被覆盖的端口，允许使用（服务正在运行是正常的）
+            if [[ "$INSTALL_MODE" == "replace" && "$custom_port" == "$REPLACE_PORT" ]]; then
+                echo "$custom_port"
+                return
+            fi
+            
+            # 其他情况：提示端口被占用
             _warn "端口 $custom_port 系统占用中" >&2
             read -rp "  是否强制使用? (可能导致启动失败) [y/N]: " force
             if [[ "$force" =~ ^[yY]$ ]]; then
@@ -1969,6 +2235,110 @@ ask_port() {
             return
         fi
     done
+}
+
+# 处理协议已安装时的多端口选择
+# 参数: $1=protocol, $2=core(xray/singbox)
+# 返回: 0=继续安装, 1=取消
+handle_existing_protocol() {
+    local protocol="$1" core="$2"
+    
+    # 获取已有端口列表
+    local ports=$(db_list_ports "$core" "$protocol")
+    
+    if [[ -z "$ports" ]]; then
+        return 0  # 没有已安装实例，继续
+    fi
+    
+    echo ""
+    echo -e "${CYAN}检测到协议 ${YELLOW}$protocol${CYAN} 已安装以下端口实例：${NC}"
+    echo "$ports" | while read -r port; do
+        echo -e "    ${G}●${NC} 端口 ${G}$port${NC}"
+    done
+    echo ""
+    
+    echo -e "${YELLOW}请选择操作：${NC}"
+    echo -e "  ${G}1${NC}) 添加新端口实例"
+    echo -e "  ${G}2${NC}) 覆盖现有端口"
+    echo "  0) 返回"
+    echo ""
+    
+    local choice
+    read -p "$(echo -e "  ${GREEN}请输入选项 [0-2]:${NC} ")" choice
+    
+    case "$choice" in
+        1)
+            INSTALL_MODE="add"
+            return 0
+            ;;
+        2)
+            INSTALL_MODE="replace"
+            # 选择要覆盖的端口
+            echo ""
+            echo -e "${YELLOW}请选择要覆盖的端口：${NC}"
+            local port_array=($ports)
+            local i=1
+            for port in "${port_array[@]}"; do
+                echo -e "  ${G}$i${NC}) 端口 ${G}$port${NC}"
+                ((i++))
+            done
+            echo "  0) 返回"
+            echo ""
+            
+            local port_choice
+            read -p "$(echo -e "  ${GREEN}请输入选项 [0-$((i-1))]:${NC} ")" port_choice
+            
+            if [[ "$port_choice" == "0" ]]; then
+                echo -e "${YELLOW}已取消，返回上级菜单${NC}"
+                return 1
+            elif [[ "$port_choice" =~ ^[0-9]+$ ]] && [ "$port_choice" -ge 1 ] && [ "$port_choice" -le "$((i-1))" ]; then
+                REPLACE_PORT="${port_array[$((port_choice-1))]}"
+                return 0
+            else
+                echo -e "${RED}无效选项${NC}"
+                return 1
+            fi
+            ;;
+        0)
+            echo -e "${YELLOW}已取消，返回上级菜单${NC}"
+            return 1
+            ;;
+        *)
+            echo -e "${RED}无效选项${NC}"
+            return 1
+            ;;
+    esac
+}
+
+# 检查端口是否被其他协议占用
+# 参数: $1=port, $2=current_protocol, $3=current_core
+# 返回: 0=未占用, 1=已占用
+check_port_conflict() {
+    local check_port="$1" current_protocol="$2" current_core="$3"
+    
+    # 检查 xray 协议
+    for proto in $(db_list_protocols "xray"); do
+        [[ "$proto" == "$current_protocol" && "$current_core" == "xray" ]] && continue
+        
+        local ports=$(db_list_ports "xray" "$proto")
+        if echo "$ports" | grep -q "^${check_port}$"; then
+            echo -e "${RED}错误: 端口 $check_port 已被协议 $proto 占用${NC}"
+            return 1
+        fi
+    done
+    
+    # 检查 singbox 协议
+    for proto in $(db_list_protocols "singbox"); do
+        [[ "$proto" == "$current_protocol" && "$current_core" == "singbox" ]] && continue
+        
+        local ports=$(db_list_ports "singbox" "$proto")
+        if echo "$ports" | grep -q "^${check_port}$"; then
+            echo -e "${RED}错误: 端口 $check_port 已被协议 $proto 占用${NC}"
+            return 1
+        fi
+    done
+    
+    return 0
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -13060,10 +13430,11 @@ show_all_share_links() {
 }
 
 # 显示单个协议的详细配置信息（包含链接和二维码）
-# 参数: $1=协议名, $2=是否清屏(可选，默认true)
+# 参数: $1=协议名, $2=是否清屏(可选，默认true), $3=指定端口(可选)
 show_single_protocol_info() {
     local protocol="$1"
     local clear_screen="${2:-true}"
+    local specified_port="$3"
     
     # 从数据库读取配置
     local cfg=""
@@ -13076,6 +13447,52 @@ show_single_protocol_info() {
     else
         _err "协议配置不存在: $protocol"
         return
+    fi
+    
+    # 检查是否为数组（多端口）
+    if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        if [[ -n "$specified_port" ]]; then
+            # 指定了端口：直接使用该端口的配置
+            cfg=$(echo "$cfg" | jq --arg port "$specified_port" '.[] | select(.port == ($port | tonumber))')
+            if [[ -z "$cfg" || "$cfg" == "null" ]]; then
+                _err "未找到端口 $specified_port 的配置"
+                return
+            fi
+        else
+            # 未指定端口：显示选择菜单
+            local ports=$(echo "$cfg" | jq -r '.[].port')
+            local port_array=($ports)
+            local port_count=${#port_array[@]}
+            
+            if [[ $port_count -gt 1 ]]; then
+                echo ""
+                echo -e "${CYAN}协议 ${YELLOW}$protocol${CYAN} 有 ${port_count} 个端口实例：${NC}"
+                echo ""
+                local i=1
+                for p in "${port_array[@]}"; do
+                    echo -e "  ${G}$i${NC}) 端口 ${G}$p${NC}"
+                    ((i++))
+                done
+                echo "  0) 返回"
+                echo ""
+                
+                local choice
+                read -p "$(echo -e "  ${GREEN}请选择要查看的端口 [0-$port_count]:${NC} ")" choice
+                
+                if [[ "$choice" == "0" ]]; then
+                    return
+                elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$port_count" ]; then
+                    # 提取选中端口的配置
+                    cfg=$(echo "$cfg" | jq ".[$((choice-1))]")
+                else
+                    _err "无效选项"
+                    return
+                fi
+            else
+                # 只有一个端口，直接使用
+                cfg=$(echo "$cfg" | jq ".[0]")
+            fi
+        fi
     fi
     
     # 从 JSON 提取字段
@@ -13646,8 +14063,21 @@ show_protocols_overview() {
     if [[ -n "$xray_protocols" ]]; then
         echo -e "  ${Y}Xray 协议 (共享服务):${NC}"
         for protocol in $xray_protocols; do
-            local port=$(db_get_field "xray" "$protocol" "port")
-            [[ -n "$port" ]] && echo -e "    ${G}●${NC} $(get_protocol_name $protocol) - 端口: ${G}$port${NC}"
+            # 获取所有端口实例
+            local ports=$(db_list_ports "xray" "$protocol")
+            if [[ -n "$ports" ]]; then
+                local port_count=$(echo "$ports" | wc -l)
+                if [[ $port_count -eq 1 ]]; then
+                    # 单端口显示
+                    echo -e "    ${G}●${NC} $(get_protocol_name $protocol) - 端口: ${G}$ports${NC}"
+                else
+                    # 多端口显示
+                    echo -e "    ${G}●${NC} $(get_protocol_name $protocol) - 端口: ${G}$port_count 个实例${NC}"
+                    echo "$ports" | while read -r port; do
+                        echo -e "      ${C}├─${NC} 端口 ${G}$port${NC}"
+                    done
+                fi
+            fi
         done
         echo ""
     fi
@@ -13655,8 +14085,21 @@ show_protocols_overview() {
     if [[ -n "$singbox_protocols" ]]; then
         echo -e "  ${Y}Sing-box 协议 (共享服务):${NC}"
         for protocol in $singbox_protocols; do
-            local port=$(db_get_field "singbox" "$protocol" "port")
-            [[ -n "$port" ]] && echo -e "    ${G}●${NC} $(get_protocol_name $protocol) - 端口: ${G}$port${NC}"
+            # 获取所有端口实例
+            local ports=$(db_list_ports "singbox" "$protocol")
+            if [[ -n "$ports" ]]; then
+                local port_count=$(echo "$ports" | wc -l)
+                if [[ $port_count -eq 1 ]]; then
+                    # 单端口显示
+                    echo -e "    ${G}●${NC} $(get_protocol_name $protocol) - 端口: ${G}$ports${NC}"
+                else
+                    # 多端口显示
+                    echo -e "    ${G}●${NC} $(get_protocol_name $protocol) - 端口: ${G}$port_count 个实例${NC}"
+                    echo "$ports" | while read -r port; do
+                        echo -e "      ${C}├─${NC} 端口 ${G}$port${NC}"
+                    done
+                fi
+            fi
         done
         echo ""
     fi
@@ -13718,6 +14161,69 @@ show_services_status() {
     _line
 }
 
+# 选择要卸载的端口实例
+# 参数: $1=protocol
+# 返回: 选中的端口号，存储在 SELECTED_PORT 变量中
+select_port_to_uninstall() {
+    local protocol="$1"
+    
+    # 确定核心类型
+    local core="xray"
+    if [[ " $SINGBOX_PROTOCOLS " == *" $protocol "* ]]; then
+        core="singbox"
+    fi
+    
+    # 获取端口列表
+    local ports=$(db_list_ports "$core" "$protocol")
+    
+    if [[ -z "$ports" ]]; then
+        echo -e "${RED}错误: 未找到协议 $protocol 的端口实例${NC}"
+        return 1
+    fi
+    
+    # 转换为数组
+    local port_array=($ports)
+    local port_count=${#port_array[@]}
+    
+    # 只有一个端口，直接选择
+    if [[ $port_count -eq 1 ]]; then
+        SELECTED_PORT="${port_array[0]}"
+        echo -e "${CYAN}检测到协议 $protocol 只有一个端口实例: $SELECTED_PORT${NC}"
+        return 0
+    fi
+    
+    # 多个端口，让用户选择
+    echo ""
+    echo -e "${CYAN}协议 ${YELLOW}$protocol${CYAN} 有以下端口实例：${NC}"
+    echo ""
+    
+    local i=1
+    for port in "${port_array[@]}"; do
+        echo -e "  ${G}$i${NC}) 端口 ${G}$port${NC}"
+        ((i++))
+    done
+    echo -e "  ${G}$i${NC}) 卸载所有端口"
+    echo "  0) 返回"
+    echo ""
+    
+    local choice
+    read -p "$(echo -e "  ${GREEN}请选择要卸载的端口 [0-$i]:${NC} ")" choice
+    
+    if [[ "$choice" == "0" ]]; then
+        echo -e "${YELLOW}已取消，返回上级菜单${NC}"
+        return 1
+    elif [[ "$choice" == "$i" ]]; then
+        SELECTED_PORT="all"
+        return 0
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$i" ]; then
+        SELECTED_PORT="${port_array[$((choice-1))]}"
+        return 0
+    else
+        echo -e "${RED}无效选项${NC}"
+        return 1
+    fi
+}
+
 # 卸载指定协议
 uninstall_specific_protocol() {
     local installed=$(get_installed_protocols)
@@ -13744,6 +14250,17 @@ uninstall_specific_protocol() {
     local selected_protocol=$(echo "$installed" | sed -n "${choice}p")
     [[ -z "$selected_protocol" ]] && { _err "协议不存在"; return; }
     
+    # 选择要卸载的端口
+    select_port_to_uninstall "$selected_protocol" || return 1
+    
+    # 确定核心类型
+    local core="xray"
+    if [[ " $SINGBOX_PROTOCOLS " == *" $selected_protocol "* ]]; then
+        core="singbox"
+    elif [[ " $STANDALONE_PROTOCOLS " == *" $selected_protocol "* ]]; then
+        core="standalone"
+    fi
+    
     echo -e "  将卸载: ${R}$(get_protocol_name $selected_protocol)${NC}"
     read -rp "  确认卸载? [y/N]: " confirm
     [[ ! "$confirm" =~ ^[yY]$ ]] && return
@@ -13753,8 +14270,34 @@ uninstall_specific_protocol() {
     # 停止相关服务
     if [[ " $XRAY_PROTOCOLS " == *" $selected_protocol "* ]]; then
         # Xray 协议：需要重新生成配置
-        unregister_protocol "$selected_protocol"
-        rm -f "$CFG/${selected_protocol}.join"
+        # 根据选择的端口进行卸载
+        if [[ "$SELECTED_PORT" == "all" ]]; then
+            echo -e "${CYAN}卸载协议 $selected_protocol 的所有端口实例...${NC}"
+            unregister_protocol "$selected_protocol"
+            rm -f "$CFG/${selected_protocol}.join"
+        else
+            echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
+            
+            # 删除指定端口实例
+            if [[ "$core" != "standalone" ]]; then
+                db_remove_port "$core" "$selected_protocol" "$SELECTED_PORT"
+                
+                # 检查是否还有其他端口实例
+                local remaining_ports=$(db_list_ports "$core" "$selected_protocol")
+                if [[ -z "$remaining_ports" ]]; then
+                    # 没有剩余端口，完全卸载
+                    echo -e "${YELLOW}这是最后一个端口实例，将完全卸载协议${NC}"
+                    db_del "$core" "$selected_protocol"
+                    rm -f "$CFG/${selected_protocol}.join"
+                else
+                    echo -e "${GREEN}协议 $selected_protocol 还有其他端口实例在运行${NC}"
+                fi
+            else
+                # 独立协议不支持多端口，直接卸载
+                unregister_protocol "$selected_protocol"
+                rm -f "$CFG/${selected_protocol}.join"
+            fi
+        fi
         
         # 检查是否还有其他 Xray 协议
         local remaining_xray=$(get_xray_protocols)
@@ -13790,8 +14333,34 @@ uninstall_specific_protocol() {
             rm -rf "$CFG/certs/tuic"
         fi
         
-        unregister_protocol "$selected_protocol"
-        rm -f "$CFG/${selected_protocol}.join"
+        # 根据选择的端口进行卸载
+        if [[ "$SELECTED_PORT" == "all" ]]; then
+            echo -e "${CYAN}卸载协议 $selected_protocol 的所有端口实例...${NC}"
+            unregister_protocol "$selected_protocol"
+            rm -f "$CFG/${selected_protocol}.join"
+        else
+            echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
+            
+            # 删除指定端口实例
+            if [[ "$core" != "standalone" ]]; then
+                db_remove_port "$core" "$selected_protocol" "$SELECTED_PORT"
+                
+                # 检查是否还有其他端口实例
+                local remaining_ports=$(db_list_ports "$core" "$selected_protocol")
+                if [[ -z "$remaining_ports" ]]; then
+                    # 没有剩余端口，完全卸载
+                    echo -e "${YELLOW}这是最后一个端口实例，将完全卸载协议${NC}"
+                    db_del "$core" "$selected_protocol"
+                    rm -f "$CFG/${selected_protocol}.join"
+                else
+                    echo -e "${GREEN}协议 $selected_protocol 还有其他端口实例在运行${NC}"
+                fi
+            else
+                # 独立协议不支持多端口，直接卸载
+                unregister_protocol "$selected_protocol"
+                rm -f "$CFG/${selected_protocol}.join"
+            fi
+        fi
         
         # 检查是否还有其他 Sing-box 协议
         local remaining_singbox=$(get_singbox_protocols)
@@ -13834,8 +14403,34 @@ uninstall_specific_protocol() {
             [[ -n "$backend_svc" ]] && svc stop "$backend_svc" 2>/dev/null
         fi
         
-        unregister_protocol "$selected_protocol"
-        rm -f "$CFG/${selected_protocol}.join"
+        # 根据选择的端口进行卸载
+        if [[ "$SELECTED_PORT" == "all" ]]; then
+            echo -e "${CYAN}卸载协议 $selected_protocol 的所有端口实例...${NC}"
+            unregister_protocol "$selected_protocol"
+            rm -f "$CFG/${selected_protocol}.join"
+        else
+            echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
+            
+            # 删除指定端口实例
+            if [[ "$core" != "standalone" ]]; then
+                db_remove_port "$core" "$selected_protocol" "$SELECTED_PORT"
+                
+                # 检查是否还有其他端口实例
+                local remaining_ports=$(db_list_ports "$core" "$selected_protocol")
+                if [[ -z "$remaining_ports" ]]; then
+                    # 没有剩余端口，完全卸载
+                    echo -e "${YELLOW}这是最后一个端口实例，将完全卸载协议${NC}"
+                    db_del "$core" "$selected_protocol"
+                    rm -f "$CFG/${selected_protocol}.join"
+                else
+                    echo -e "${GREEN}协议 $selected_protocol 还有其他端口实例在运行${NC}"
+                fi
+            else
+                # 独立协议不支持多端口，直接卸载
+                unregister_protocol "$selected_protocol"
+                rm -f "$CFG/${selected_protocol}.join"
+            fi
+        fi
         
         # 删除配置文件
         case "$selected_protocol" in
@@ -14160,104 +14755,71 @@ do_install_server() {
     # 检查协议是否为空（用户选择返回）
     [[ -z "$protocol" ]] && return 1
     
+    # 确定核心类型
+    local core="xray"
+    if [[ " $SINGBOX_PROTOCOLS " == *" $protocol "* ]]; then
+        core="singbox"
+    elif [[ " $STANDALONE_PROTOCOLS " == *" $protocol "* ]]; then
+        core="standalone"
+    fi
+    
     # 检查该协议是否已安装
     if is_protocol_installed "$protocol"; then
-        _warn "协议 $(get_protocol_name $protocol) 已安装"
-        read -rp "  是否重新安装? [y/N]: " reinstall
-        if [[ "$reinstall" =~ ^[yY]$ ]]; then
+        # 处理已安装协议的多端口选择
+        if [[ "$core" != "standalone" ]]; then
+            handle_existing_protocol "$protocol" "$core" || return 1
+        else
+            # 独立协议保持原有的重新安装确认
+            echo -e "${YELLOW}检测到 $protocol 已安装，将清理旧配置...${NC}"
+            read -rp "  是否重新安装? [y/N]: " reinstall
+            [[ "$reinstall" =~ ^[yY]$ ]] || return
             _info "卸载现有 $protocol 协议..."
             
-            # 根据协议类型进行清理
-            if [[ " $XRAY_PROTOCOLS " == *" $protocol "* ]]; then
-                # Xray 协议：停止服务，删除配置，重新生成
-                unregister_protocol "$protocol"
-                rm -f "$CFG/${protocol}.join"
-                
-                local remaining_xray=$(get_xray_protocols)
-                if [[ -n "$remaining_xray" ]]; then
-                    svc stop vless-reality 2>/dev/null
-                    rm -f "$CFG/config.json"
-                    generate_xray_config
-                    svc start vless-reality 2>/dev/null
-                else
-                    svc stop vless-reality 2>/dev/null
-                    rm -f "$CFG/config.json"
+            # 独立协议 (Snell/AnyTLS/ShadowTLS)：停止服务，删除配置和服务文件
+            local service_name="vless-${protocol}"
+            
+            # 停止主服务
+            svc stop "$service_name" 2>/dev/null
+            
+            # ShadowTLS 组合协议：还需要停止后端服务
+            if [[ "$protocol" == "snell-shadowtls" || "$protocol" == "snell-v5-shadowtls" || "$protocol" == "ss2022-shadowtls" ]]; then
+                local backend_svc="${BACKEND_NAME[$protocol]}"
+                [[ -n "$backend_svc" ]] && svc stop "$backend_svc" 2>/dev/null
+            fi
+            
+            unregister_protocol "$protocol"
+            rm -f "$CFG/${protocol}.join"
+            
+            # 删除配置文件
+            case "$protocol" in
+                snell) rm -f "$CFG/snell.conf" ;;
+                snell-v5) rm -f "$CFG/snell-v5.conf" ;;
+                snell-shadowtls) rm -f "$CFG/snell-shadowtls.conf" ;;
+                snell-v5-shadowtls) rm -f "$CFG/snell-v5-shadowtls.conf" ;;
+                ss2022-shadowtls) rm -f "$CFG/ss2022-shadowtls-backend.json" ;;
+            esac
+            
+            # 删除服务文件
+            if [[ "$DISTRO" == "alpine" ]]; then
+                rc-update del "$service_name" default 2>/dev/null
+                rm -f "/etc/init.d/$service_name"
+                # ShadowTLS 后端服务
+                if [[ -n "${BACKEND_NAME[$protocol]:-}" ]]; then
+                    rc-update del "${BACKEND_NAME[$protocol]}" default 2>/dev/null
+                    rm -f "/etc/init.d/${BACKEND_NAME[$protocol]}"
                 fi
-                
-            elif [[ " $SINGBOX_PROTOCOLS " == *" $protocol "* ]]; then
-                # Sing-box 协议 (hy2/tuic)：清理特定资源
-                
-                # Hysteria2/TUIC: 先清理 iptables 端口跳跃规则
-                [[ "$protocol" == "hy2" || "$protocol" == "tuic" ]] && cleanup_hy2_nat_rules
-                
-                # 停止服务
-                svc stop vless-singbox 2>/dev/null
-                
-                unregister_protocol "$protocol"
-                rm -f "$CFG/${protocol}.join"
-                
-                # 删除协议特定的证书目录
-                [[ "$protocol" == "hy2" ]] && rm -rf "$CFG/certs/hy2"
-                [[ "$protocol" == "tuic" ]] && rm -rf "$CFG/certs/tuic"
-                
-                local remaining_singbox=$(get_singbox_protocols)
-                if [[ -n "$remaining_singbox" ]]; then
-                    rm -f "$CFG/singbox.json"
-                    generate_singbox_config
-                    svc start vless-singbox 2>/dev/null
-                else
-                    rm -f "$CFG/singbox.json"
+            else
+                systemctl disable "$service_name" 2>/dev/null
+                rm -f "/etc/systemd/system/${service_name}.service"
+                # ShadowTLS 后端服务
+                if [[ -n "${BACKEND_NAME[$protocol]:-}" ]]; then
+                    systemctl disable "${BACKEND_NAME[$protocol]}" 2>/dev/null
+                    rm -f "/etc/systemd/system/${BACKEND_NAME[$protocol]}.service"
                 fi
-                
-            elif [[ " $STANDALONE_PROTOCOLS " == *" $protocol "* ]]; then
-                # 独立协议 (Snell/AnyTLS/ShadowTLS)：停止服务，删除配置和服务文件
-                local service_name="vless-${protocol}"
-                
-                # 停止主服务
-                svc stop "$service_name" 2>/dev/null
-                
-                # ShadowTLS 组合协议：还需要停止后端服务
-                if [[ "$protocol" == "snell-shadowtls" || "$protocol" == "snell-v5-shadowtls" || "$protocol" == "ss2022-shadowtls" ]]; then
-                    local backend_svc="${BACKEND_NAME[$protocol]}"
-                    [[ -n "$backend_svc" ]] && svc stop "$backend_svc" 2>/dev/null
-                fi
-                
-                unregister_protocol "$protocol"
-                rm -f "$CFG/${protocol}.join"
-                
-                # 删除配置文件
-                case "$protocol" in
-                    snell) rm -f "$CFG/snell.conf" ;;
-                    snell-v5) rm -f "$CFG/snell-v5.conf" ;;
-                    snell-shadowtls) rm -f "$CFG/snell-shadowtls.conf" ;;
-                    snell-v5-shadowtls) rm -f "$CFG/snell-v5-shadowtls.conf" ;;
-                    ss2022-shadowtls) rm -f "$CFG/ss2022-shadowtls-backend.json" ;;
-                esac
-                
-                # 删除服务文件
-                if [[ "$DISTRO" == "alpine" ]]; then
-                    rc-update del "$service_name" default 2>/dev/null
-                    rm -f "/etc/init.d/$service_name"
-                    # ShadowTLS 后端服务
-                    if [[ -n "${BACKEND_NAME[$protocol]:-}" ]]; then
-                        rc-update del "${BACKEND_NAME[$protocol]}" default 2>/dev/null
-                        rm -f "/etc/init.d/${BACKEND_NAME[$protocol]}"
-                    fi
-                else
-                    systemctl disable "$service_name" 2>/dev/null
-                    rm -f "/etc/systemd/system/${service_name}.service"
-                    # ShadowTLS 后端服务
-                    if [[ -n "${BACKEND_NAME[$protocol]:-}" ]]; then
-                        systemctl disable "${BACKEND_NAME[$protocol]}" 2>/dev/null
-                        rm -f "/etc/systemd/system/${BACKEND_NAME[$protocol]}.service"
-                    fi
-                    systemctl daemon-reload
-                fi
+                systemctl daemon-reload
             fi
             
             _ok "旧配置已清理"
-        else
-            return
         fi
     fi
     
@@ -15196,8 +15758,30 @@ do_install_server() {
         # 清理临时文件
         rm -f "$CFG/.nginx_port_tmp" 2>/dev/null
         
-        # 显示刚安装的协议配置（不清屏）
-        show_single_protocol_info "$current_protocol" false
+        # 获取当前安装的端口号
+        local installed_port=""
+        if [[ "$INSTALL_MODE" == "replace" && -n "$REPLACE_PORT" ]]; then
+            # 覆盖模式：使用被覆盖的端口（可能已更新为新端口）
+            installed_port="$REPLACE_PORT"
+        else
+            # 添加/首次安装模式：从配置中获取端口
+            if db_exists "xray" "$current_protocol"; then
+                local cfg=$(db_get "xray" "$current_protocol")
+                if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                    # 数组：获取最后一个端口（最新添加的）
+                    installed_port=$(echo "$cfg" | jq -r '.[-1].port')
+                else
+                    # 单对象：直接获取端口
+                    installed_port=$(echo "$cfg" | jq -r '.port')
+                fi
+            elif db_exists "singbox" "$current_protocol"; then
+                local cfg=$(db_get "singbox" "$current_protocol")
+                installed_port=$(echo "$cfg" | jq -r '.port')
+            fi
+        fi
+
+        # 显示刚安装的协议配置（不清屏，指定端口）
+        show_single_protocol_info "$current_protocol" false "$installed_port"
         _pause
     else
         _err "安装失败"
@@ -15213,12 +15797,16 @@ show_status() {
     
     [[ ! -f "$DB_FILE" ]] && { echo -e "  状态: ${D}○ 未安装${NC}"; return; }
     
-    # 一次 jq 调用，输出格式: XRAY:proto1,proto2 SINGBOX:proto3 PORTS:proto1=443,proto2=8080 RULES:count
+    # 一次 jq 调用，输出格式: XRAY:proto1,proto2 SINGBOX:proto3 PORTS:proto1=443|58380,proto2=8080 RULES:count
+    # 兼容数组和对象两种格式：数组提取所有端口用|分隔，对象直接取端口
     local db_parsed=$(jq -r '
-        "XRAY:" + ((.xray // {}) | keys | join(",")) + 
-        " SINGBOX:" + ((.singbox // {}) | keys | join(",")) + 
+        "XRAY:" + ((.xray // {}) | keys | join(",")) +
+        " SINGBOX:" + ((.singbox // {}) | keys | join(",")) +
         " RULES:" + ((.routing_rules // []) | length | tostring) +
-        " PORTS:" + ([(.xray // {} | to_entries[] | "\(.key)=\(.value.port)"), (.singbox // {} | to_entries[] | "\(.key)=\(.value.port)")] | join(","))
+        " PORTS:" + ([
+            (.xray // {} | to_entries[] | "\(.key)=" + (if (.value | type) == "array" then ([.value[].port] | map(tostring) | join("|")) else (.value.port | tostring) end)),
+            (.singbox // {} | to_entries[] | "\(.key)=" + (if (.value | type) == "array" then ([.value[].port] | map(tostring) | join("|")) else (.value.port | tostring) end))
+        ] | join(","))
     ' "$DB_FILE" 2>/dev/null)
     
     # 解析结果
@@ -15302,19 +15890,23 @@ show_status() {
         done
     }
     
-    # 显示协议概要
+    # 显示协议概要（统一使用列表格式）
     if [[ $protocol_count -eq 1 ]]; then
-        local proto_name=$(echo "$installed" | head -1)
-        local port=$(_get_port "$proto_name")
-        echo -e "  协议: ${C}$(get_protocol_name $proto_name)${NC}"
-        echo -e "  端口: ${C}$port${NC}"
+        echo -e "  协议: ${C}已安装 (${protocol_count}个)${NC}"
     else
-        echo -e "  协议: ${C}多协议 (${protocol_count}个)${NC}"
-        for proto in $installed; do
-            local proto_port=$(_get_port "$proto")
-            echo -e "    ${G}•${NC} $(get_protocol_name $proto) ${D}- 端口: ${proto_port}${NC}"
-        done
+        echo -e "  协议: ${C}已安装 (${protocol_count}个)${NC}"
     fi
+
+    # 统一列表显示所有协议和端口
+    for proto in $installed; do
+        local proto_ports=$(_get_port "$proto")
+        # 处理多端口显示（用|分隔）
+        if [[ "$proto_ports" == *"|"* ]]; then
+            echo -e "    ${G}•${NC} $(get_protocol_name $proto) ${D}- 端口: ${proto_ports//|/, }${NC}"
+        else
+            echo -e "    ${G}•${NC} $(get_protocol_name $proto) ${D}- 端口: ${proto_ports}${NC}"
+        fi
+    done
     
     # 显示分流状态
     if [[ "$rules_count" -gt 0 ]]; then
@@ -16435,71 +17027,85 @@ gen_v2ray_sub() {
         fi
         [[ -z "$cfg" ]] && continue
         
-        # 提取字段
-        local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
-        local port=$(echo "$cfg" | jq -r '.port // empty')
-        local sni=$(echo "$cfg" | jq -r '.sni // empty')
-        local short_id=$(echo "$cfg" | jq -r '.short_id // empty')
-        local public_key=$(echo "$cfg" | jq -r '.public_key // empty')
-        local path=$(echo "$cfg" | jq -r '.path // empty')
-        local password=$(echo "$cfg" | jq -r '.password // empty')
-        local username=$(echo "$cfg" | jq -r '.username // empty')
-        local method=$(echo "$cfg" | jq -r '.method // empty')
-        local psk=$(echo "$cfg" | jq -r '.psk // empty')
-        
-        # 对于回落子协议，使用主协议端口
-        local actual_port="$port"
-        if [[ -n "$master_port" && ("$protocol" == "vless-ws" || "$protocol" == "vmess-ws") ]]; then
-            actual_port="$master_port"
+        # 检查是否为数组（多端口）
+        local cfg_stream=""
+        if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            # 多端口：遍历每个端口实例
+            cfg_stream=$(echo "$cfg" | jq -c '.[]')
+        else
+            # 单端口：使用原有逻辑
+            cfg_stream=$(echo "$cfg" | jq -c '.')
         fi
         
-        local link=""
-        case "$protocol" in
-            vless)
-                [[ -n "$server_ip" ]] && link=$(gen_vless_link "$server_ip" "$actual_port" "$uuid" "$public_key" "$short_id" "$sni" "$country_code")
-                ;;
-            vless-xhttp)
-                [[ -n "$server_ip" ]] && link=$(gen_vless_xhttp_link "$server_ip" "$actual_port" "$uuid" "$public_key" "$short_id" "$sni" "$path" "$country_code")
-                ;;
-            vless-ws)
-                [[ -n "$server_ip" ]] && link=$(gen_vless_ws_link "$server_ip" "$actual_port" "$uuid" "$sni" "$path" "$country_code")
-                ;;
-            vless-vision)
-                [[ -n "$server_ip" ]] && link=$(gen_vless_vision_link "$server_ip" "$actual_port" "$uuid" "$sni" "$country_code")
-                ;;
-            vmess-ws)
-                [[ -n "$server_ip" ]] && link=$(gen_vmess_ws_link "$server_ip" "$actual_port" "$uuid" "$sni" "$path" "$country_code")
-                ;;
-            trojan)
-                [[ -n "$server_ip" ]] && link=$(gen_trojan_link "$server_ip" "$actual_port" "$password" "$sni" "$country_code")
-                ;;
-            ss2022)
-                [[ -n "$server_ip" ]] && link=$(gen_ss2022_link "$server_ip" "$actual_port" "$method" "$password" "$country_code")
-                ;;
-            ss-legacy)
-                [[ -n "$server_ip" ]] && link=$(gen_ss_legacy_link "$server_ip" "$actual_port" "$method" "$password" "$country_code")
-                ;;
-            hy2)
-                [[ -n "$server_ip" ]] && link=$(gen_hy2_link "$server_ip" "$actual_port" "$password" "$sni" "$country_code")
-                ;;
-            tuic)
-                [[ -n "$server_ip" ]] && link=$(gen_tuic_link "$server_ip" "$actual_port" "$uuid" "$password" "$sni" "$country_code")
-                ;;
-            anytls)
-                [[ -n "$server_ip" ]] && link=$(gen_anytls_link "$server_ip" "$actual_port" "$password" "$sni" "$country_code")
-                ;;
-            snell)
-                [[ -n "$server_ip" ]] && link=$(gen_snell_link "$server_ip" "$actual_port" "$psk" "4" "$country_code")
-                ;;
-            snell-v5)
-                [[ -n "$server_ip" ]] && link=$(gen_snell_v5_link "$server_ip" "$actual_port" "$psk" "5" "$country_code")
-                ;;
-            socks)
-                [[ -n "$server_ip" ]] && link=$(gen_socks_link "$server_ip" "$actual_port" "$username" "$password" "$country_code")
-                ;;
-        esac
-        
-        [[ -n "$link" ]] && links+="$link"$'\n'
+        while IFS= read -r cfg; do
+            [[ -z "$cfg" ]] && continue
+            
+            # 提取字段
+            local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
+            local port=$(echo "$cfg" | jq -r '.port // empty')
+            local sni=$(echo "$cfg" | jq -r '.sni // empty')
+            local short_id=$(echo "$cfg" | jq -r '.short_id // empty')
+            local public_key=$(echo "$cfg" | jq -r '.public_key // empty')
+            local path=$(echo "$cfg" | jq -r '.path // empty')
+            local password=$(echo "$cfg" | jq -r '.password // empty')
+            local username=$(echo "$cfg" | jq -r '.username // empty')
+            local method=$(echo "$cfg" | jq -r '.method // empty')
+            local psk=$(echo "$cfg" | jq -r '.psk // empty')
+            
+            # 对于回落子协议，使用主协议端口
+            local actual_port="$port"
+            if [[ -n "$master_port" && ("$protocol" == "vless-ws" || "$protocol" == "vmess-ws") ]]; then
+                actual_port="$master_port"
+            fi
+            
+            local link=""
+            case "$protocol" in
+                vless)
+                    [[ -n "$server_ip" ]] && link=$(gen_vless_link "$server_ip" "$actual_port" "$uuid" "$public_key" "$short_id" "$sni" "$country_code")
+                    ;;
+                vless-xhttp)
+                    [[ -n "$server_ip" ]] && link=$(gen_vless_xhttp_link "$server_ip" "$actual_port" "$uuid" "$public_key" "$short_id" "$sni" "$path" "$country_code")
+                    ;;
+                vless-ws)
+                    [[ -n "$server_ip" ]] && link=$(gen_vless_ws_link "$server_ip" "$actual_port" "$uuid" "$sni" "$path" "$country_code")
+                    ;;
+                vless-vision)
+                    [[ -n "$server_ip" ]] && link=$(gen_vless_vision_link "$server_ip" "$actual_port" "$uuid" "$sni" "$country_code")
+                    ;;
+                vmess-ws)
+                    [[ -n "$server_ip" ]] && link=$(gen_vmess_ws_link "$server_ip" "$actual_port" "$uuid" "$sni" "$path" "$country_code")
+                    ;;
+                trojan)
+                    [[ -n "$server_ip" ]] && link=$(gen_trojan_link "$server_ip" "$actual_port" "$password" "$sni" "$country_code")
+                    ;;
+                ss2022)
+                    [[ -n "$server_ip" ]] && link=$(gen_ss2022_link "$server_ip" "$actual_port" "$method" "$password" "$country_code")
+                    ;;
+                ss-legacy)
+                    [[ -n "$server_ip" ]] && link=$(gen_ss_legacy_link "$server_ip" "$actual_port" "$method" "$password" "$country_code")
+                    ;;
+                hy2)
+                    [[ -n "$server_ip" ]] && link=$(gen_hy2_link "$server_ip" "$actual_port" "$password" "$sni" "$country_code")
+                    ;;
+                tuic)
+                    [[ -n "$server_ip" ]] && link=$(gen_tuic_link "$server_ip" "$actual_port" "$uuid" "$password" "$sni" "$country_code")
+                    ;;
+                anytls)
+                    [[ -n "$server_ip" ]] && link=$(gen_anytls_link "$server_ip" "$actual_port" "$password" "$sni" "$country_code")
+                    ;;
+                snell)
+                    [[ -n "$server_ip" ]] && link=$(gen_snell_link "$server_ip" "$actual_port" "$psk" "4" "$country_code")
+                    ;;
+                snell-v5)
+                    [[ -n "$server_ip" ]] && link=$(gen_snell_v5_link "$server_ip" "$actual_port" "$psk" "5" "$country_code")
+                    ;;
+                socks)
+                    [[ -n "$server_ip" ]] && link=$(gen_socks_link "$server_ip" "$actual_port" "$username" "$password" "$country_code")
+                    ;;
+            esac
+            
+            [[ -n "$link" ]] && links+="$link"$'\n'
+        done <<< "$cfg_stream"
     done
     
     # 合并外部节点
@@ -16544,28 +17150,41 @@ gen_clash_sub() {
         fi
         [[ -z "$cfg" ]] && continue
         
-        # 提取字段
-        local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
-        local port=$(echo "$cfg" | jq -r '.port // empty')
-        local sni=$(echo "$cfg" | jq -r '.sni // empty')
-        local short_id=$(echo "$cfg" | jq -r '.short_id // empty')
-        local public_key=$(echo "$cfg" | jq -r '.public_key // empty')
-        local path=$(echo "$cfg" | jq -r '.path // empty')
-        local password=$(echo "$cfg" | jq -r '.password // empty')
-        local username=$(echo "$cfg" | jq -r '.username // empty')
-        local method=$(echo "$cfg" | jq -r '.method // empty')
-        local psk=$(echo "$cfg" | jq -r '.psk // empty')
-        
-        # 对于回落子协议，使用主协议端口
-        local actual_port="$port"
-        if [[ -n "$master_port" && ("$protocol" == "vless-ws" || "$protocol" == "vmess-ws") ]]; then
-            actual_port="$master_port"
+        # 检查是否为数组（多端口）
+        local cfg_stream=""
+        if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            # 多端口：遍历每个端口实例
+            cfg_stream=$(echo "$cfg" | jq -c '.[]')
+        else
+            # 单端口：使用原有逻辑
+            cfg_stream=$(echo "$cfg" | jq -c '.')
         fi
         
-        local name="${country_code}-$(get_protocol_name $protocol)-${ip_suffix}"
-        local proxy=""
-        
-        case "$protocol" in
+        while IFS= read -r cfg; do
+            [[ -z "$cfg" ]] && continue
+            
+            # 提取字段
+            local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
+            local port=$(echo "$cfg" | jq -r '.port // empty')
+            local sni=$(echo "$cfg" | jq -r '.sni // empty')
+            local short_id=$(echo "$cfg" | jq -r '.short_id // empty')
+            local public_key=$(echo "$cfg" | jq -r '.public_key // empty')
+            local path=$(echo "$cfg" | jq -r '.path // empty')
+            local password=$(echo "$cfg" | jq -r '.password // empty')
+            local username=$(echo "$cfg" | jq -r '.username // empty')
+            local method=$(echo "$cfg" | jq -r '.method // empty')
+            local psk=$(echo "$cfg" | jq -r '.psk // empty')
+            
+            # 对于回落子协议，使用主协议端口
+            local actual_port="$port"
+            if [[ -n "$master_port" && ("$protocol" == "vless-ws" || "$protocol" == "vmess-ws") ]]; then
+                actual_port="$master_port"
+            fi
+            
+            local name="${country_code}-$(get_protocol_name $protocol)-${ip_suffix}"
+            local proxy=""
+            
+            case "$protocol" in
             vless)
                 [[ -n "$server_ip" ]] && proxy="  - name: \"$name\"
     type: vless
@@ -16706,12 +17325,13 @@ gen_clash_sub() {
     sni: $sni
     skip-cert-verify: true"
                 ;;
-        esac
-        
-        if [[ -n "$proxy" ]]; then
-            proxies+="$proxy"$'\n'
-            proxy_names+="      - \"$name\""$'\n'
-        fi
+            esac
+            
+            if [[ -n "$proxy" ]]; then
+                proxies+="$proxy"$'\n'
+                proxy_names+="      - \"$name\""$'\n'
+            fi
+        done <<< "$cfg_stream"
     done
     
     # 合并外部节点
@@ -16777,40 +17397,55 @@ gen_surge_sub() {
         fi
         [[ -z "$cfg" ]] && continue
         
-        local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
-        local port=$(echo "$cfg" | jq -r '.port // empty')
-        local sni=$(echo "$cfg" | jq -r '.sni // empty')
-        local password=$(echo "$cfg" | jq -r '.password // empty')
-        local method=$(echo "$cfg" | jq -r '.method // empty')
-        local psk=$(echo "$cfg" | jq -r '.psk // empty')
-        local version=$(echo "$cfg" | jq -r '.version // empty')
-        
-        local name="${country_code}-$(get_protocol_name $protocol)-${ip_suffix}"
-        local proxy=""
-        
-        case "$protocol" in
-            trojan)
-                [[ -n "$server_ip" ]] && proxy="$name = trojan, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=true"
-                ;;
-            ss2022)
-                [[ -n "$server_ip" ]] && proxy="$name = ss, $server_ip, $port, encrypt-method=$method, password=$password"
-                ;;
-            ss-legacy)
-                [[ -n "$server_ip" ]] && proxy="$name = ss, $server_ip, $port, encrypt-method=$method, password=$password"
-                ;;
-            hy2)
-                [[ -n "$server_ip" ]] && proxy="$name = hysteria2, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=true"
-                ;;
-            snell|snell-v5)
-                [[ -n "$server_ip" ]] && proxy="$name = snell, $server_ip, $port, psk=$psk, version=${version:-4}"
-                ;;
-        esac
-        
-        if [[ -n "$proxy" ]]; then
-            proxies+="$proxy"$'\n'
-            [[ -n "$proxy_names" ]] && proxy_names+=", "
-            proxy_names+="$name"
+        # 检查是否为数组（多端口）
+        local cfg_stream=""
+        if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            # 多端口：遍历每个端口实例
+            cfg_stream=$(echo "$cfg" | jq -c '.[]')
+        else
+            # 单端口：使用原有逻辑
+            cfg_stream=$(echo "$cfg" | jq -c '.')
         fi
+        
+        while IFS= read -r cfg; do
+            [[ -z "$cfg" ]] && continue
+            
+            # 提取字段
+            local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
+            local port=$(echo "$cfg" | jq -r '.port // empty')
+            local sni=$(echo "$cfg" | jq -r '.sni // empty')
+            local password=$(echo "$cfg" | jq -r '.password // empty')
+            local method=$(echo "$cfg" | jq -r '.method // empty')
+            local psk=$(echo "$cfg" | jq -r '.psk // empty')
+            local version=$(echo "$cfg" | jq -r '.version // empty')
+            
+            local name="${country_code}-$(get_protocol_name $protocol)-${ip_suffix}"
+            local proxy=""
+            
+            case "$protocol" in
+                trojan)
+                    [[ -n "$server_ip" ]] && proxy="$name = trojan, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=true"
+                    ;;
+                ss2022)
+                    [[ -n "$server_ip" ]] && proxy="$name = ss, $server_ip, $port, encrypt-method=$method, password=$password"
+                    ;;
+                ss-legacy)
+                    [[ -n "$server_ip" ]] && proxy="$name = ss, $server_ip, $port, encrypt-method=$method, password=$password"
+                    ;;
+                hy2)
+                    [[ -n "$server_ip" ]] && proxy="$name = hysteria2, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=true"
+                    ;;
+                snell|snell-v5)
+                    [[ -n "$server_ip" ]] && proxy="$name = snell, $server_ip, $port, psk=$psk, version=${version:-4}"
+                    ;;
+            esac
+            
+            if [[ -n "$proxy" ]]; then
+                proxies+="$proxy"$'\n'
+                [[ -n "$proxy_names" ]] && proxy_names+=", "
+                proxy_names+="$name"
+            fi
+        done <<< "$cfg_stream"
     done
     
     # 合并外部节点 (仅支持 vmess/trojan/ss/hysteria2)
