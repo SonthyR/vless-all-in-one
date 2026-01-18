@@ -15258,13 +15258,20 @@ do_install_server() {
             if [[ "$auth_choice" == "2" ]]; then
                 auth_mode="noauth"
                 # 询问监听地址
-                local default_listen="127.0.0.1"
+                # 根据系统双栈支持选择默认本地监听地址
+                local default_listen
+                if _has_ipv6 && _can_dual_stack_listen; then
+                    default_listen="::1"
+                else
+                    default_listen="127.0.0.1"
+                fi
                 echo ""
                 _line
                 echo -e "  ${W}监听地址配置${NC}"
                 _line
-                echo -e "  ${D}建议仅监听本地地址 (127.0.0.1) 以提高安��性${NC}"
-                echo -e "  ${D}监听 0.0.0.0 将允许所有地址访问${NC}"
+                echo -e "  ${D}建议仅监听本地地址以提高安全性${NC}"
+                echo -e "  ${D}双栈系统使用 ::1，仅 IPv4 使用 127.0.0.1${NC}"
+                echo -e "  ${D}监听 0.0.0.0 或 :: 将允许所有地址访问${NC}"
                 echo ""
                 read -rp "  请输入监听地址 [回车使用 $default_listen]: " _listen
                 listen_addr="${_listen:-$default_listen}"
