@@ -23,6 +23,10 @@
 
 > <img src="https://cloud.yt.net/logo.png" height="50"> [YT.NET](https://cloud.yt.net/?ref=13192) -  原生 IP / 送CNIX NAT入口 / 深港节点 / BGP国际网络
 
+>🌐 **指纹浏览器推荐** - 配合代理使用效果更佳：
+
+> <img src="https://roxybrowser.com/favicon.ico" height="50"> [RoxyBrowser](https://roxybrowser.com?code=0128SUFA) - 多账号独立环境 / 防关联检测 / 团队协作 / 浏览器指纹隔离 / 代理绑定 / AI多账号管理
+
 ## ✨ 支持协议
 
 | # | 协议 | 特点 | 推荐场景 |
