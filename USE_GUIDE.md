@@ -21,6 +21,8 @@
 13. [配置管理](#配置管理)
 14. [常见问题](#常见问题)
 
+> 📖 **详细故障排查**：请参阅 [FAQ.md](FAQ.md) 获取完整的诊断命令和排查步骤。
+
 ---
 
 ## 快速开始
@@ -93,6 +95,7 @@ vless
 | VMess + WS | Xray | 443 | 兼容性好 | 老客户端 |
 | VLESS-Vision | Xray | 443 | TLS 主协议 | 端口复用 |
 | Trojan | Xray | 443 | HTTPS 伪装 | 端口复用 |
+| Trojan-WS | Xray | 443 | WebSocket 传输 | 回落子协议 |
 | SOCKS5 | Xray | 自定义 | 通用协议 | 本地代理 |
 | SS2022 | Xray | 自定义 | AEAD 2022 | 兼容需求 |
 | Hysteria2 | Sing-box | UDP | 基于 QUIC，速度快 | UDP 加速 |

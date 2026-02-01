@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.5] - 2026-02-01
+
+### Added
+- 新增 Trojan-WS 协议支持
+  - Trojan 安装时可选择 TCP 或 WebSocket 传输模式
+  - Trojan-WS 支持作为回落子协议（复用 443 端口）
+- 新增 FAQ.md 故障排查文档
+  - 完整诊断脚本和常见问题解答
+
+### Fixed
+- 修复 AnyTLS 协议服务无法启动的问题
+- 修复 TG 每日推送无法触发的问题
+
 ## [3.4.4] - 2026-01-31
 
 ### Fixed

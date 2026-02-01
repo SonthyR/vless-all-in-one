@@ -6,7 +6,7 @@
 [![GitHub License](https://img.shields.io/github/license/Chil30/vless-all-in-one?style=flat-square)](https://github.com/Chil30/vless-all-in-one/blob/main/LICENSE)
 [![GitHub Downloads](https://img.shields.io/github/downloads/Chil30/vless-all-in-one/total?style=flat-square&logo=github)](https://github.com/Chil30/vless-all-in-one/releases)
 
-一个简单易用的多协议代理部署脚本，支持 **14 种主流协议**，服务端/客户端一键安装，适用于 Alpine、Debian、Ubuntu、CentOS 等 Linux 发行版。
+一个简单易用的多协议代理部署脚本，支持 **15 种主流协议**，服务端/客户端一键安装，适用于 Alpine、Debian、Ubuntu、CentOS 等 Linux 发行版。
 
 > 🙏 **声明**：本人只是一个搬运工，脚本灵感来源于网络上的各种优秀项目，特别感谢 [mack-a/v2ray-agent](https://github.com/mack-a/v2ray-agent) 八合一脚本的启发。
 
@@ -40,11 +40,12 @@
 | 7 | **Shadowsocks 2022** | 新版加密，性能好 | SS 用户迁移 |
 | 8 | **Hysteria2** | UDP 加速，端口跳跃 | 🔥 游戏/视频 |
 | 9 | **Trojan** | TLS主协议，支持回落 | ⭐ 伪装 HTTPS |
-| 10 | **Snell v4** | Surge 专用协议 (支持 ShadowTLS) | iOS/Mac 用户 |
-| 11 | **Snell v5** | Surge 5.0 新版协议 (支持 ShadowTLS) | 最新 Surge |
-| 12 | **AnyTLS** | 多协议 TLS 代理 | 抗审查能力强 |
-| 13 | **TUIC v5** | QUIC 协议，端口跳跃 | 低延迟 |
-| 14 | **NaïveProxy** | HTTP/2 代理，抗检测 | 伪装能力强 |
+| 10 | **Trojan + WS** | WebSocket 传输，可做回落 | 端口复用 |
+| 11 | **Snell v4** | Surge 专用协议 (支持 ShadowTLS) | iOS/Mac 用户 |
+| 12 | **Snell v5** | Surge 5.0 新版协议 (支持 ShadowTLS) | 最新 Surge |
+| 13 | **AnyTLS** | 多协议 TLS 代理 | 抗审查能力强 |
+| 14 | **TUIC v5** | QUIC 协议，端口跳跃 | 低延迟 |
+| 15 | **NaïveProxy** | HTTP/2 代理，抗检测 | 伪装能力强 |
 
 > 💡 **ShadowTLS 插件**：Snell v4、Snell v5、SS2022 安装时可选择启用 ShadowTLS (v3) 插件，实现 TLS 流量伪装。
 
@@ -59,6 +60,7 @@
 | VMess + WS | ✅ | ❌ | ✅ | ✅ | WebSocket |
 | VLESS-Vision | ❌ | ❌ | ✅(主) | ✅ | XTLS |
 | Trojan | ❌ | ❌ | ✅(主) | ✅ | TLS |
+| Trojan + WS | ✅ | ❌ | ✅ | ✅ | WebSocket |
 | Hysteria2 | ❌ | ✅ | ❌ | ✅ | QUIC |
 | TUIC v5 | ❌ | ✅ | ❌ | ✅ | QUIC |
 | NaïveProxy | ✅ | ✅ | ❌ | ✅ | HTTP/2 |
@@ -81,13 +83,13 @@
 
 **高性能传输：**
 - **VLESS + XHTTP** - HTTP/2 多路复用，高并发场景性能优异
-- **VLESS + XHTTP + CDN** - 🆕 支持 CDN 代理，IP被墙也能用
+- **VLESS + XHTTP + CDN** - 支持 CDN 代理，IP被墙也能用
 - **Hysteria2** - QUIC 协议，UDP 加速，游戏/视频体验好
 - **TUIC v5** - QUIC 协议，低延迟
 
 **端口复用：**
 - **VLESS-Vision / Trojan** - 作为 TLS 主协议监听 443
-- **VLESS-WS / VMess-WS** - 作为回落子协议，共享 443 端口
+- **VLESS-WS / VMess-WS / Trojan-WS** - 作为回落子协议，共享 443 端口
 
 ---
 
@@ -225,6 +227,7 @@ vless → 6) 订阅服务管理
                               ↓ 回落
                          VLESS-WS (子协议，监听 127.0.0.1)
                          VMess-WS (子协议，监听 127.0.0.1)
+                         Trojan-WS (子协议，监听 127.0.0.1)
 ```
 
 ### 使用方法
@@ -470,6 +473,8 @@ vless → 9) CF Tunnel(Argo)
 ---
 
 ## ❓ 常见问题
+
+> 📖 **完整故障排查指南**：请参阅 [FAQ.md](FAQ.md)，包含 20 个排查章节、诊断命令和快速诊断脚本。
 
 ### Q: 订阅链接返回 404
 - 检查 Nginx 是否运行：`ss -tlnp | grep 8443`

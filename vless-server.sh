@@ -1,6 +1,6 @@
 #!/bin/bash
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.4.4 [服务端]
+#  多协议代理一键部署脚本 v3.4.5 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -17,7 +17,7 @@
 #  项目地址: https://github.com/Chil30/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.4.4"
+readonly VERSION="3.4.5"
 readonly AUTHOR="Chil30"
 readonly REPO_URL="https://github.com/Chil30/vless-all-in-one"
 readonly SCRIPT_REPO="Chil30/vless-all-in-one"
@@ -442,6 +442,8 @@ get_protocol_name() {
         snell-v5) echo "Snell v5" ;;
         snell-shadowtls) echo "Snell+ShadowTLS" ;;
         snell-v5-shadowtls) echo "Snell v5+ShadowTLS" ;;
+        trojan) echo "Trojan" ;;
+        trojan-ws) echo "Trojan-WS" ;;
         anytls) echo "AnyTLS" ;;
         *) echo "$proto" ;;
     esac
@@ -1415,9 +1417,12 @@ sync_all_user_traffic() {
     
     [[ ! -f "$DB_FILE" ]] && return 1
     
+    # 检查是否需要发送每日报告 (在流量统计之前调用，确保不会被 early return 跳过)
+    check_daily_report
+    
     # 检查 Xray 是否运行 (使用兼容 Alpine 的 _pgrep)
     if ! _pgrep xray; then
-        return 1
+        return 0  # 改为 return 0，因为每日报告已处理，不算错误
     fi
     
     # 使用临时文件存储 API 结果，避免内存问题
@@ -1519,9 +1524,6 @@ sync_all_user_traffic() {
         generate_xray_config 2>/dev/null
         svc restart vless-reality 2>/dev/null
     fi
-    
-    # 检查是否需要发送每日报告
-    check_daily_report
     
     return 0
 }
@@ -1677,13 +1679,12 @@ _save_join_info() {
 }
 
 
-# 检测主协议并返回外部端口
+# 检测 TLS 主协议并返回外部端口（用于 WS 类回落协议）
+# 注意：Reality (vless) 不支持 WS 回落，只有 vless-vision 和 trojan 可以
 # 用法: outer_port=$(_get_master_port "$default_port")
 _get_master_port() {
     local default_port="$1"
-    if db_exists "xray" "vless"; then
-        db_get_field "xray" "vless" "port"
-    elif db_exists "xray" "vless-vision"; then
+    if db_exists "xray" "vless-vision"; then
         db_get_field "xray" "vless-vision" "port"
     elif db_exists "xray" "trojan"; then
         db_get_field "xray" "trojan" "port"
@@ -1692,9 +1693,10 @@ _get_master_port() {
     fi
 }
 
-# 检测是否有主协议 (支持 TLS 回落的协议)
+# 检测是否有 TLS 主协议 (支持 WS 回落的协议)
+# 注意：Reality 使用 uTLS，不支持 WS 类型的回落
 _has_master_protocol() {
-    db_exists "xray" "vless" || db_exists "xray" "vless-vision" || db_exists "xray" "trojan"
+    db_exists "xray" "vless-vision" || db_exists "xray" "trojan"
 }
 
 # 检查证书是否为 CA 签发的真实证书
@@ -2028,7 +2030,7 @@ fi
 #═══════════════════════════════════════════════════════════════════════════════
 
 # 协议分类定义 (重构: Sing-box 接管独立协议)
-XRAY_PROTOCOLS="vless vless-xhttp vless-xhttp-cdn vless-ws vless-ws-notls vmess-ws vless-vision trojan socks ss2022 ss-legacy"
+XRAY_PROTOCOLS="vless vless-xhttp vless-xhttp-cdn vless-ws vless-ws-notls vmess-ws vless-vision trojan trojan-ws socks ss2022 ss-legacy"
 # Sing-box 管理的协议 (原独立协议，现统一由 Sing-box 处理)
 SINGBOX_PROTOCOLS="hy2 tuic"
 # 仍需独立进程的协议 (Snell 等闭源协议)
@@ -2920,7 +2922,7 @@ add_xray_inbound_v2() {
     
     # 构建回落数组
     local fallbacks='[{"dest":"127.0.0.1:80","xver":0}]'
-    local ws_port="" ws_path="" vmess_port="" vmess_path=""
+    local ws_port="" ws_path="" vmess_port="" vmess_path="" trojan_ws_port="" trojan_ws_path=""
     
     # 检查 vless-ws 回落
     if db_exists "xray" "vless-ws"; then
@@ -2934,12 +2936,21 @@ add_xray_inbound_v2() {
         vmess_path=$(db_get_field "xray" "vmess-ws" "path")
     fi
     
+    # 检查 trojan-ws 回落
+    if db_exists "xray" "trojan-ws"; then
+        trojan_ws_port=$(db_get_field "xray" "trojan-ws" "port")
+        trojan_ws_path=$(db_get_field "xray" "trojan-ws" "path")
+    fi
+    
     # 使用 jq 构建回落数组
     if [[ -n "$ws_port" && -n "$ws_path" ]]; then
         fallbacks=$(echo "$fallbacks" | jq --arg p "$ws_path" --argjson d "$ws_port" '. += [{"path":$p,"dest":$d,"xver":0}]')
     fi
     if [[ -n "$vmess_port" && -n "$vmess_path" ]]; then
         fallbacks=$(echo "$fallbacks" | jq --arg p "$vmess_path" --argjson d "$vmess_port" '. += [{"path":$p,"dest":$d,"xver":0}]')
+    fi
+    if [[ -n "$trojan_ws_port" && -n "$trojan_ws_path" ]]; then
+        fallbacks=$(echo "$fallbacks" | jq --arg p "$trojan_ws_path" --argjson d "$trojan_ws_port" '. += [{"path":$p,"dest":$d,"xver":0}]')
     fi
     
     local inbound_json=""
@@ -3273,6 +3284,64 @@ add_xray_inbound_v2() {
                 },
                 tag: $tag
             }' > "$tmp_inbound"
+            ;;
+        trojan-ws)
+            local path=$(echo "$cfg" | jq -r '.path // "/trojan"')
+            local sni=$(echo "$cfg" | jq -r '.sni // "bing.com"')
+            
+            # 获取完整的用户列表（包含子用户和 email，用于流量统计）
+            local clients=$(gen_xray_trojan_clients "$base_protocol")
+            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"password\":\"$password\",\"email\":\"default@${base_protocol}\"}]"
+            
+            # Trojan-WS 作为回落协议或独立运行
+            if _has_master_protocol; then
+                # 作为主协议的回落，监听本地端口
+                jq -n \
+                    --argjson port "$port" \
+                    --argjson clients "$clients" \
+                    --arg path "$path" \
+                    --arg sni "$sni" \
+                    --arg tag "$inbound_tag" \
+                '{
+                    port: $port,
+                    listen: "127.0.0.1",
+                    protocol: "trojan",
+                    settings: {clients: $clients},
+                    streamSettings: {
+                        network: "ws",
+                        security: "none",
+                        wsSettings: {path: $path, headers: {Host: $sni}}
+                    },
+                    tag: $tag
+                }' > "$tmp_inbound"
+            else
+                # 独立运行，需要 TLS
+                jq -n \
+                    --argjson port "$port" \
+                    --argjson clients "$clients" \
+                    --arg cert "$CFG/certs/server.crt" \
+                    --arg key "$CFG/certs/server.key" \
+                    --arg path "$path" \
+                    --arg sni "$sni" \
+                    --arg tag "$inbound_tag" \
+                    --arg listen_addr "$listen_addr" \
+                '{
+                    port: $port,
+                    listen: $listen_addr,
+                    protocol: "trojan",
+                    settings: {clients: $clients},
+                    streamSettings: {
+                        network: "ws",
+                        security: "tls",
+                        tlsSettings: {
+                            alpn: ["http/1.1"],
+                            certificates: [{certificateFile: $cert, keyFile: $key}]
+                        },
+                        wsSettings: {path: $path, headers: {Host: $sni}}
+                    },
+                    tag: $tag
+                }' > "$tmp_inbound"
+            fi
             ;;
         socks)
             local use_tls=$(echo "$cfg" | jq -r '.tls // "false"')
@@ -4805,6 +4874,13 @@ gen_trojan_link() {
     printf '%s\n' "trojan://${password}@${ip}:${port}?security=tls&sni=${sni}&type=tcp&allowInsecure=1#${name}"
 }
 
+gen_trojan_ws_link() {
+    local ip="$1" port="$2" password="$3" sni="$4" path="${5:-/trojan}" country="${6:-}"
+    local ip_suffix=$(get_ip_suffix "$ip")
+    local name="${country:+${country}-}Trojan-WS${ip_suffix:+-${ip_suffix}}"
+    printf '%s\n' "trojan://${password}@${ip}:${port}?security=tls&sni=${sni}&type=ws&host=${sni}&path=$(urlencode "$path")&allowInsecure=1#${name}"
+}
+
 gen_vless_ws_link() {
     local ip="$1" port="$2" uuid="$3" sni="$4" path="${5:-/}" country="${6:-}"
     local ip_suffix=$(get_ip_suffix "$ip")
@@ -5509,7 +5585,7 @@ setup_cert_and_nginx() {
     
     # === 回落子协议检测：如果是 WS 协议且有主协议，跳过 Nginx 配置 ===
     local is_fallback_mode=false
-    if [[ "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" ]]; then
+    if [[ "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan-ws" ]]; then
         if db_exists "xray" "vless-vision" || db_exists "xray" "trojan"; then
             is_fallback_mode=true
         fi
@@ -8713,6 +8789,21 @@ gen_trojan_server_config() {
     echo "server" > "$CFG/role"
 }
 
+# Trojan+WS+TLS 服务端配置
+gen_trojan_ws_server_config() {
+    local password="$1" port="$2" sni="${3:-bing.com}" path="${4:-/trojan}" force_new_cert="${5:-false}"
+    mkdir -p "$CFG"
+    
+    local outer_port=$(_get_master_port "$port")
+    _has_master_protocol || _handle_standalone_cert "$sni" "$force_new_cert"
+
+    register_protocol "trojan-ws" "$(build_config \
+        password "$password" port "$port" outer_port "$outer_port" sni "$sni" path "$path")"
+    _save_join_info "trojan-ws" "TROJAN-WS|%s|$outer_port|$password|$sni|$path" \
+        "gen_trojan_ws_link %s $outer_port $password $sni $path"
+    echo "server" > "$CFG/role"
+}
+
 # VLESS+WS+TLS 服务端配置
 gen_vless_ws_server_config() {
     local uuid="$1" port="$2" sni="${3:-bing.com}" path="${4:-/vless}" force_new_cert="${5:-false}"
@@ -9363,8 +9454,8 @@ create_service() {
     case "$kind" in
         anytls)
             _need_cfg "anytls" "AnyTLS" || return 1
-            port=$(db_get_field "singbox" "anytls" "port")
-            password=$(db_get_field "singbox" "anytls" "password")
+            port=$(db_get_field "xray" "anytls" "port")
+            password=$(db_get_field "xray" "anytls" "password")
             local lh=$(_listen_addr)
             exec_cmd="/usr/local/bin/anytls-server -l $(_fmt_hostport "$lh" "$port") -p ${password}"
             exec_name="anytls-server"
@@ -15468,7 +15559,7 @@ show_all_share_links() {
             
             # 检测回落协议端口
             local display_port="$port"
-            if [[ -n "$master_port" && ("$protocol" == "vless-ws" || "$protocol" == "vmess-ws") ]]; then
+            if [[ -n "$master_port" && ("$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan-ws") ]]; then
                 display_port="$master_port"
             fi
             
@@ -15487,6 +15578,7 @@ show_all_share_links() {
                     ss-legacy) link=$(gen_ss_legacy_link "$ipv4" "$display_port" "$method" "$password" "$country_code") ;;
                     hy2) link=$(gen_hy2_link "$ipv4" "$display_port" "$password" "$sni" "$country_code") ;;
                     trojan) link=$(gen_trojan_link "$ipv4" "$display_port" "$password" "$sni" "$country_code") ;;
+                    trojan-ws) link=$(gen_trojan_ws_link "$ipv4" "$display_port" "$password" "$sni" "$path" "$country_code") ;;
                     snell) link=$(gen_snell_link "$ipv4" "$display_port" "$psk" "$version" "$country_code") ;;
                     snell-v5) link=$(gen_snell_v5_link "$ipv4" "$display_port" "$psk" "$version" "$country_code") ;;
                     tuic) link=$(gen_tuic_link "$ipv4" "$display_port" "$uuid" "$password" "$sni" "$country_code") ;;
@@ -15531,6 +15623,7 @@ show_all_share_links() {
                     ss-legacy) link=$(gen_ss_legacy_link "$ip6" "$display_port" "$method" "$password" "$country_code") ;;
                     hy2) link=$(gen_hy2_link "$ip6" "$display_port" "$password" "$sni" "$country_code") ;;
                     trojan) link=$(gen_trojan_link "$ip6" "$display_port" "$password" "$sni" "$country_code") ;;
+                    trojan-ws) link=$(gen_trojan_ws_link "$ip6" "$display_port" "$password" "$sni" "$path" "$country_code") ;;
                     snell) link=$(gen_snell_link "$ip6" "$display_port" "$psk" "$version" "$country_code") ;;
                     snell-v5) link=$(gen_snell_v5_link "$ip6" "$display_port" "$psk" "$version" "$country_code") ;;
                     tuic) link=$(gen_tuic_link "$ip6" "$display_port" "$uuid" "$password" "$sni" "$country_code") ;;
@@ -15662,12 +15755,13 @@ show_single_protocol_info() {
     [[ -z "$ipv4" ]] && ipv4=$(get_ipv4)
     [[ -z "$ipv6" ]] && ipv6=$(get_ipv6)
     
-    # 检测是否为回落子协议（WS/VMess-WS 在有主协议时使用主协议端口）
+    # 检测是否为回落子协议（WS 在有 TLS 主协议时使用主协议端口）
+    # 注意：Reality 不支持 WS 回落，只有 Vision/Trojan 可以
     local display_port="$port"
     local is_fallback_protocol=false
     local master_name=""
-    if [[ "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" ]]; then
-        # 检查是否有主协议 (Vision/Trojan/Reality)
+    if [[ "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan-ws" ]]; then
+        # 检查是否有 TLS 主协议 (Vision/Trojan)，注意 Reality 不能作为 WS 的主协议
         if db_exists "xray" "vless-vision"; then
             local master_port=$(db_get_field "xray" "vless-vision" "port")
             if [[ -n "$master_port" ]]; then
@@ -15682,14 +15776,8 @@ show_single_protocol_info() {
                 is_fallback_protocol=true
                 master_name="Trojan"
             fi
-        elif db_exists "xray" "vless"; then
-            local master_port=$(db_get_field "xray" "vless" "port")
-            if [[ -n "$master_port" ]]; then
-                display_port="$master_port"
-                is_fallback_protocol=true
-                master_name="Reality"
-            fi
         fi
+        # 注意：不检测 vless (Reality)，因为 Reality 使用 uTLS 而非真实 TLS，不支持 WS 回落
     fi
     
     [[ "$clear_screen" == "true" ]] && _header
@@ -15806,6 +15894,17 @@ show_single_protocol_info() {
             echo ""
             echo -e "  ${Y}Loon 配置:${NC}"
             echo -e "  ${C}${country_code}-Trojan = trojan, ${config_ip}, ${display_port}, \"${password}\", udp=true, over-tls=true, sni=${sni}${NC}"
+            ;;
+        trojan-ws)
+            echo -e "  密码: ${G}$password${NC}"
+            echo -e "  SNI: ${G}$sni${NC}"
+            [[ -n "$path" ]] && echo -e "  Path: ${G}$path${NC}"
+            echo ""
+            echo -e "  ${Y}Surge 配置:${NC}"
+            echo -e "  ${C}${country_code}-Trojan-WS = trojan, ${config_ip}, ${display_port}, password=${password}, sni=${sni}, ws=true, ws-path=${path}, skip-cert-verify=true${NC}"
+            echo ""
+            echo -e "  ${Y}Loon 配置:${NC}"
+            echo -e "  ${C}${country_code}-Trojan-WS = trojan, ${config_ip}, ${display_port}, \"${password}\", transport=ws, path=${path}, host=${sni}, udp=true, over-tls=true, sni=${sni}, skip-cert-verify=true${NC}"
             ;;
         anytls)
             echo -e "  密码: ${G}$password${NC}"
@@ -15967,6 +16066,10 @@ show_single_protocol_info() {
                 link=$(gen_trojan_link "$ip_addr" "$link_port" "$password" "$sni" "$country_code")
                 join_code=$(echo "TROJAN|${ip_addr}|${link_port}|${password}|${sni}" | base64 -w 0)
                 ;;
+            trojan-ws)
+                link=$(gen_trojan_ws_link "$ip_addr" "$link_port" "$password" "$sni" "$path" "$country_code")
+                join_code=$(echo "TROJAN-WS|${ip_addr}|${link_port}|${password}|${sni}|${path}" | base64 -w 0)
+                ;;
             snell)
                 link=$(gen_snell_link "$ip_addr" "$link_port" "$psk" "$version" "$country_code")
                 join_code=$(echo "SNELL|${ip_addr}|${link_port}|${psk}|${version}" | base64 -w 0)
@@ -16055,8 +16158,8 @@ show_single_protocol_info() {
         echo -e "  ${D}提示: 服务器支持 IPv6 ($ipv6)，如需使用请自行替换地址${NC}"
     fi
     
-    # 自签名证书提示（VMess-WS、VLESS-WS、VLESS-Vision、Trojan、Hysteria2 使用自签名证书时）
-    if [[ "$protocol" =~ ^(vmess-ws|vless-ws|vless-vision|trojan|hy2)$ ]]; then
+    # 自签名证书提示（VMess-WS、VLESS-WS、VLESS-Vision、Trojan、Trojan-WS、Hysteria2 使用自签名证书时）
+    if [[ "$protocol" =~ ^(vmess-ws|vless-ws|vless-vision|trojan|trojan-ws|hy2)$ ]]; then
         # 检查是否是自签名证书（没有真实域名）
         local is_self_signed=true
         if [[ -f "$CFG/cert_domain" ]]; then
@@ -17830,20 +17933,52 @@ do_install_server() {
         trojan)
             local password=$(gen_password)
             
+            # 选择传输模式
+            echo ""
+            _line
+            echo -e "  ${C}选择 Trojan 传输模式${NC}"
+            _line
+            echo -e "  ${G}1)${NC} TCP+TLS (默认，支持回落)"
+            echo -e "  ${G}2)${NC} WebSocket+TLS (支持 CDN 转发)"
+            _line
+            echo ""
+            read -rp "  请选择 [1-2，回车默认1]: " trojan_mode
+            trojan_mode="${trojan_mode:-1}"
+            
+            local use_ws=false
+            local path="/trojan"
+            [[ "$trojan_mode" == "2" ]] && use_ws=true
+            
             # 使用统一的证书和 Nginx 配置函数
-            setup_cert_and_nginx "trojan"
+            if [[ "$use_ws" == "true" ]]; then
+                setup_cert_and_nginx "trojan-ws"
+            else
+                setup_cert_and_nginx "trojan"
+            fi
             local cert_domain="$CERT_DOMAIN"
             
             # 询问SNI配置
             local final_sni=$(ask_sni_config "$(gen_sni)" "$cert_domain")
             
+            # WS 模式询问 path
+            if [[ "$use_ws" == "true" ]]; then
+                echo ""
+                read -rp "  WebSocket 路径 [回车默认 $path]: " ws_path
+                [[ -n "$ws_path" ]] && path="$ws_path"
+            fi
+            
             echo ""
             _line
-            echo -e "  ${C}Trojan 配置${NC}"
+            if [[ "$use_ws" == "true" ]]; then
+                echo -e "  ${C}Trojan-WS 配置${NC}"
+            else
+                echo -e "  ${C}Trojan 配置${NC}"
+            fi
             _line
             echo -e "  端口: ${G}$port${NC}"
             echo -e "  密码: ${G}$password${NC}"
             echo -e "  SNI: ${G}$final_sni${NC}"
+            [[ "$use_ws" == "true" ]] && echo -e "  Path: ${G}$path${NC}"
             [[ -n "$CERT_DOMAIN" ]] && echo -e "  订阅端口: ${G}$NGINX_PORT${NC}"
             _line
             echo ""
@@ -17851,7 +17986,12 @@ do_install_server() {
             [[ "$confirm" =~ ^[nN]$ ]] && return
             
             _info "生成配置..."
-            gen_trojan_server_config "$password" "$port" "$final_sni"
+            if [[ "$use_ws" == "true" ]]; then
+                gen_trojan_ws_server_config "$password" "$port" "$final_sni" "$path"
+                protocol="trojan-ws"  # 更新协议名，确保后续查找正确
+            else
+                gen_trojan_server_config "$password" "$port" "$final_sni"
+            fi
             ;;
         snell|snell-v5)
             # 根据协议确定版本
