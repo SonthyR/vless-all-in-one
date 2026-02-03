@@ -23,6 +23,8 @@
 
 > <img src="https://cloud.yt.net/logo.png" height="50"> [YT.NET](https://cloud.yt.net/?ref=13192) -  原生 IP / 送CNIX NAT入口 / 深港节点 / BGP国际网络
 
+> <img src="https://dash.lain.sh/img/favicon-16x16.png" height="50"> [Lain.sh](https://dash.lain.sh?ref=Charonlio) -  原生IP / 解锁流媒体 / 家宽 ISP / 独立服务器
+
 >🌐 **指纹浏览器推荐** - 配合代理使用效果更佳：
 
 > <img src="https://roxybrowser.com/favicon.ico" height="50"> [RoxyBrowser](https://roxybrowser.com?code=0128SUFA) - 多账号独立环境/ 多端同步 / 防关联检测 / 团队协作 / 浏览器指纹隔离 / 代理绑定 / AI多账号管理
@@ -562,6 +564,7 @@ apk add curl jq unzip iproute2 nginx
 | **Aether Cloud** | 原生IP / IPv6家宽 / 高性价比 | [购买](https://billing.aethercloud.io?ref=Ers87GElwp) |
 | **AkileCloud** | 多地区 / SOCKS5落地 / 家宽 IP | [购买](https://akile.io/register?aff_code=b349580b-113a-4b42-ab76-c2db81c5c22d) |
 | **YT.NET** | 原生IP / 深港节点 / BGP国际网络 | [购买](https://cloud.yt.net/?ref=13192) |
+| **lain.sh** | 原生IP / 解锁流媒体 / 家宽 ISP | [购买](https://dash.lain.sh?ref=Charonlio) |
 
 ### 🎁 RoxyBrowser 指纹浏览器 - 专属链接注册享 10% 优惠，👆 点击图片注册
 
