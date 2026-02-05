@@ -657,6 +657,7 @@ tail -f /var/log/nginx/access.log
 tail -f /var/log/nginx/error.log
 ```
 
+
 ### 13.4 独立协议日志
 
 ```bash
@@ -669,6 +670,91 @@ journalctl -u vless-snell-shadowtls -f
 # AnyTLS
 journalctl -u vless-anytls -f
 ```
+
+### 13.5 Alpine 系统日志 (OpenRC)
+
+```bash
+# Xray 日志
+tail -f /var/log/vless/xray.log
+
+# Sing-box 日志
+tail -f /var/log/vless/singbox.log
+
+# 系统日志
+tail -f /var/log/messages | grep -E "xray|sing-box|vless"
+```
+
+### 13.6 开启 Debug 模式排查
+
+默认日志级别只显示 warning，需开启 debug 模式才能看到详细路由信息。
+
+**Xray 开启 debug 模式：**
+```bash
+# 编辑配置文件
+sed -i 's/"loglevel":"warning"/"loglevel":"debug"/' /etc/vless-reality/config.json
+
+# 重启服务
+systemctl restart vless-reality    # systemd
+rc-service vless-reality restart   # Alpine
+
+# 查看详细日志
+journalctl -u vless-reality -f     # systemd
+tail -f /var/log/vless/xray.log    # Alpine
+
+# 恢复 warning 级别
+sed -i 's/"loglevel":"debug"/"loglevel":"warning"/' /etc/vless-reality/config.json
+```
+
+**Sing-box 开启 debug 模式：**
+```bash
+# 编辑配置文件
+sed -i 's/"level":"warn"/"level":"debug"/' /etc/vless-reality/singbox.json
+
+# 重启服务
+systemctl restart vless-singbox    # systemd
+rc-service vless-singbox restart   # Alpine
+
+# 查看详细日志
+journalctl -u vless-singbox -f     # systemd
+tail -f /var/log/vless/singbox.log # Alpine
+
+# 恢复 warn 级别
+sed -i 's/"level":"debug"/"level":"warn"/' /etc/vless-reality/singbox.json
+```
+
+### 13.7 用户路由排查
+
+**检查用户路由配置：**
+```bash
+# Xray 用户路由规则
+cat /etc/vless-reality/config.json | jq '.routing.rules[] | select(.user)'
+
+# Sing-box 用户路由规则
+cat /etc/vless-reality/singbox.json | jq '.route.rules[] | select(.auth_user)'
+
+# 数据库中的用户路由设置
+cat /etc/vless-reality/db.json | jq '.xray | .. | .users? // empty | .[] | {name, routing}'
+cat /etc/vless-reality/db.json | jq '.singbox | .. | .users? // empty | .[] | {name, routing}'
+```
+
+**检查链式代理 outbound：**
+```bash
+# Xray 链式代理 outbound
+cat /etc/vless-reality/config.json | jq '.outbounds[] | select(.tag | contains("chain"))'
+
+# Sing-box 链式代理 outbound
+cat /etc/vless-reality/singbox.json | jq '.outbounds[] | select(.tag | contains("chain"))'
+```
+
+**验证路由规则配置正确：**
+```bash
+# 检查 Xray 配置语法
+/usr/local/bin/xray run -test -c /etc/vless-reality/config.json
+
+# 检查 Sing-box 配置语法
+/usr/local/bin/sing-box check -c /etc/vless-reality/singbox.json
+```
+
 
 ---
 

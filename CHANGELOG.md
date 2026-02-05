@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.7] - 2026-02-05
+
+### Added
+- 新增 Sing-box 协议多用户支持
+  - Hysteria2/TUIC 协议支持添加多个用户
+  - 每个用户可配置独立路由（直连/WARP）
+  - 使用 `auth_user` 路由规则实现用户级分流
+  - 添加/删除用户后自动重建配置并重载服务
+  - 注：流量统计功能需要完整版 sing-box（官方精简版不支持 v2ray_api）
+
+### Fixed
+- 修复 Sing-box 升级后 Hysteria2 不可用的问题
+- 修复 Reality 安装时自签证书被误识别为真实证书的问题
+- 修复 TG 每日推送无法触发的问题
+
+### Changed
+- 增强每日流量报告内容
+  - 用户详情显示协议名称
+  - 添加已安装协议列表汇总
+- 每日推送时间支持设置到分钟
+  - 支持 HH:MM 格式（如 9:30）或 HH 格式（如 9）
+  - 已启用时可单独修改发送时间
+
 ## [3.4.6] - 2026-02-02
 
 ### Added

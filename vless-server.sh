@@ -1,6 +1,6 @@
 #!/bin/bash 
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.4.6 [服务端]
+#  多协议代理一键部署脚本 v3.4.7 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -17,7 +17,7 @@
 #  项目地址: https://github.com/Chil30/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.4.6"
+readonly VERSION="3.4.7"
 readonly AUTHOR="Chil30"
 readonly REPO_URL="https://github.com/Chil30/vless-all-in-one"
 readonly SCRIPT_REPO="Chil30/vless-all-in-one"
@@ -692,9 +692,11 @@ db_add_user() {
         return 1
     fi
     
+
+    
     # 检查用户名是否已存在 (支持多端口)
-    local exists=$(jq -r --arg p "$proto" --arg n "$name" '
-        .['\"$core\"'][$p] as $cfg |
+    local exists=$(jq -r --arg c "$core" --arg p "$proto" --arg n "$name" '
+        .[$c][$p] as $cfg |
         if $cfg == null then 0
         elif ($cfg | type) == "array" then
             [$cfg[].users // [] | .[] | select(.name == $n)] | length
@@ -730,7 +732,11 @@ db_add_user() {
     ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
     
     # 自动重建配置
-    [[ "$core" == "xray" ]] && rebuild_and_reload_xray "silent"
+    if [[ "$core" == "xray" ]]; then
+        rebuild_and_reload_xray "silent"
+    elif [[ "$core" == "singbox" ]]; then
+        rebuild_and_reload_singbox "silent"
+    fi
 }
 
 # 删除用户 (支持多端口数组格式)
@@ -752,7 +758,11 @@ db_del_user() {
     ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
     
     # 自动重建配置
-    [[ "$core" == "xray" ]] && rebuild_and_reload_xray "silent"
+    if [[ "$core" == "xray" ]]; then
+        rebuild_and_reload_xray "silent"
+    elif [[ "$core" == "singbox" ]]; then
+        rebuild_and_reload_singbox "silent"
+    fi
 }
 
 # 获取用户信息 (支持多端口数组格式)
@@ -1041,7 +1051,11 @@ db_set_user_routing() {
     ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
     
     # 自动重建配置
-    [[ "$core" == "xray" ]] && rebuild_and_reload_xray "silent"
+    if [[ "$core" == "xray" ]]; then
+        rebuild_and_reload_xray "silent"
+    elif [[ "$core" == "singbox" ]]; then
+        rebuild_and_reload_singbox "silent"
+    fi
 }
 
 # 获取用户路由 (支持多端口数组格式)
@@ -1180,14 +1194,13 @@ rebuild_and_reload_xray() {
     if generate_xray_config 2>/dev/null; then
         # 检查 Xray 服务是否在运行
         if svc status vless-reality 2>/dev/null; then
-            # 重载服务
-            if svc reload vless-reality 2>/dev/null; then
+            # 重启服务确保配置生效 (reload 可能不可靠)
+            if svc restart vless-reality 2>/dev/null; then
                 [[ -z "$silent" ]] && _ok "配置已更新并重载"
                 return 0
             else
-                [[ -z "$silent" ]] && _warn "配置已更新，服务重载失败，尝试重启..."
-                svc restart vless-reality 2>/dev/null
-                return $?
+                [[ -z "$silent" ]] && _err "配置已更新，但服务重启失败"
+                return 1
             fi
         else
             [[ -z "$silent" ]] && _ok "配置已更新"
@@ -1198,6 +1211,35 @@ rebuild_and_reload_xray() {
         return 1
     fi
 }
+
+# 用户变更后重建 Sing-box 配置并重载服务
+# 用法: rebuild_and_reload_singbox [silent]
+# 参数: silent - 如果设置则不输出成功信息
+rebuild_and_reload_singbox() {
+    local silent="${1:-}"
+    
+    # 重新生成 Sing-box 配置
+    if generate_singbox_config; then
+        # 检查 Sing-box 服务是否在运行
+        if svc status vless-singbox 2>/dev/null; then
+            # 重载服务
+            if svc restart vless-singbox 2>/dev/null; then
+                [[ -z "$silent" ]] && _ok "Sing-box 配置已更新并重载"
+                return 0
+            else
+                [[ -z "$silent" ]] && _warn "配置已更新，服务重载失败"
+                return 1
+            fi
+        else
+            [[ -z "$silent" ]] && _ok "Sing-box 配置已更新"
+            return 0
+        fi
+    else
+        [[ -z "$silent" ]] && _err "Sing-box 配置重建失败"
+        return 1
+    fi
+}
+
 
 #═══════════════════════════════════════════════════════════════════════════════
 #  TG 通知配置
@@ -1286,10 +1328,9 @@ tg_send_over_quota() {
 }
 
 # 发送每日流量报告
+# 注意: 此函数由 check_daily_report() 调用，而 check_daily_report() 由 sync_all_user_traffic() 调用
+# 因此不能在此函数内再次调用 sync_all_user_traffic()，否则会导致无限递归
 tg_send_daily_report() {
-    # 发送前先同步流量数据
-    sync_all_user_traffic "true" 2>/dev/null
-    
     local server_ip=$(get_ipv4)
     [[ -z "$server_ip" ]] && server_ip=$(get_ipv6)
     
@@ -1330,7 +1371,7 @@ tg_send_daily_report() {
                 fi
                 
                 user_details+="
-${status_icon} *${name}*
+${status_icon} *${name}* (${proto})
    ${used_fmt} / ${quota_fmt}${percent_str}"
             done <<< "$stats"
         done
@@ -1339,8 +1380,26 @@ ${status_icon} *${name}*
     report+="
 总用户: ${total_users}
 总流量: $(format_bytes $total_used)
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━"
+    
+    # 如果有用户详情则显示
+    if [[ -n "$user_details" ]]; then
+        report+="
 *用户详情:*${user_details}"
+    fi
+    
+    # 添加已安装协议列表
+    local installed_protocols=$(get_installed_protocols 2>/dev/null)
+    if [[ -n "$installed_protocols" ]]; then
+        report+="
+━━━━━━━━━━━━━━━━━━━━
+*已安装协议:*"
+        for proto in $installed_protocols; do
+            local proto_name=$(get_protocol_name "$proto")
+            report+="
+• ${proto_name}"
+        done
+    fi
     
     tg_send_message "$report"
 }
@@ -1353,14 +1412,25 @@ check_daily_report() {
     [[ "$enabled" != "true" || "$daily_enabled" != "true" ]] && return 0
     
     local report_hour=$(tg_get_config "daily_report_hour")
-    report_hour=${report_hour:-9}  # 默认早上9点
+    local report_minute=$(tg_get_config "daily_report_minute")
+    report_hour=${report_hour:-9}     # 默认早上9点
+    report_minute=${report_minute:-0}  # 默认0分
     
     local current_hour=$(date '+%H' | sed 's/^0//')
+    local current_minute=$(date '+%M' | sed 's/^0//')
     local last_report_date=$(tg_get_config "last_report_date")
     local today=$(date '+%Y-%m-%d')
     
-    # 如果当前小时等于报告时间，且今天还没发送过
-    if [[ "$current_hour" -eq "$report_hour" && "$last_report_date" != "$today" ]]; then
+    # 获取检测间隔（用于范围匹配）
+    local interval=$(get_traffic_interval)
+    interval=${interval:-5}
+    
+    # 范围匹配：当前小时等于报告小时，且当前分钟在 [报告分钟, 报告分钟+间隔) 范围内
+    # 这样即使 cron 不是精确在报告分钟运行，也能在下一个间隔内触发
+    if [[ "$current_hour" -eq "$report_hour" && 
+          "$current_minute" -ge "$report_minute" && 
+          "$current_minute" -lt "$((report_minute + interval))" && 
+          "$last_report_date" != "$today" ]]; then
         tg_send_daily_report
         tg_set_config "last_report_date" "$today"
     fi
@@ -1402,11 +1472,11 @@ get_user_traffic() {
     # 查询上行流量
     local up_result=$(xray_api_query "user>>>$email>>>traffic>>>uplink" "$reset" 2>/dev/null)
     if [[ -n "$up_result" ]]; then
-        # 使用 jq 解析，更可靠
-        uplink=$(echo "$up_result" | jq -r '.stat[]? | select(.name | contains("uplink")) | .value // 0' 2>/dev/null | head -1)
-        # 如果 jq 失败，尝试 grep
+        # 使用 jq 解析，兼容大小写字段名
+        uplink=$(echo "$up_result" | jq -r '.stat[]? | select((.name // .Name) | contains("uplink")) | (.value // .Value // 0)' 2>/dev/null | head -1)
+        # 如果 jq 失败，尝试 grep（兼容大小写）
         if [[ -z "$uplink" || "$uplink" == "null" ]]; then
-            uplink=$(echo "$up_result" | grep -o '"value":[0-9]*' | head -1 | grep -o '[0-9]*')
+            uplink=$(echo "$up_result" | grep -oiE '"value"[[:space:]]*:[[:space:]]*[0-9]+' | head -1 | grep -o '[0-9]*')
         fi
         uplink=${uplink:-0}
     fi
@@ -1414,9 +1484,9 @@ get_user_traffic() {
     # 查询下行流量
     local down_result=$(xray_api_query "user>>>$email>>>traffic>>>downlink" "$reset" 2>/dev/null)
     if [[ -n "$down_result" ]]; then
-        downlink=$(echo "$down_result" | jq -r '.stat[]? | select(.name | contains("downlink")) | .value // 0' 2>/dev/null | head -1)
+        downlink=$(echo "$down_result" | jq -r '.stat[]? | select((.name // .Name) | contains("downlink")) | (.value // .Value // 0)' 2>/dev/null | head -1)
         if [[ -z "$downlink" || "$downlink" == "null" ]]; then
-            downlink=$(echo "$down_result" | grep -o '"value":[0-9]*' | head -1 | grep -o '[0-9]*')
+            downlink=$(echo "$down_result" | grep -oiE '"value"[[:space:]]*:[[:space:]]*[0-9]+' | head -1 | grep -o '[0-9]*')
         fi
         downlink=${downlink:-0}
     fi
@@ -1448,7 +1518,7 @@ sync_all_user_traffic() {
     [[ "$reset" == "true" ]] && reset_flag="-reset"
     
     if ! xray api statsquery --server=127.0.0.1:${XRAY_API_PORT} $reset_flag 2>/dev/null | \
-         jq -r '.stat[]? | "\(.name) \(.value // 0)"' > "$tmp_stats" 2>/dev/null; then
+         jq -r '.stat[]? | "\(.name // .Name) \(.value // .Value // 0)"' > "$tmp_stats" 2>/dev/null; then
         rm -f "$tmp_stats"
         return 1
     fi
@@ -1539,11 +1609,14 @@ sync_all_user_traffic() {
         svc restart vless-reality 2>/dev/null
     fi
     
+    # 注：Sing-box 协议 (hy2/tuic) 暂不支持流量统计（需要完整版编译）
+    
     return 0
 }
 
 # 获取所有用户流量统计 (用于显示)
 # 输出格式: proto|user|uplink|downlink|total
+# 注：仅支持 Xray 协议，Sing-box (hy2/tuic) 需要完整版支持
 get_all_traffic_stats() {
     [[ ! -f "$DB_FILE" ]] && return 1
     
@@ -1551,34 +1624,40 @@ get_all_traffic_stats() {
     local tmp_stats=$(mktemp)
     trap "rm -f '$tmp_stats'" RETURN
     
-    # 一次性获取所有流量统计，直接用管道处理
-    if ! xray api statsquery --server=127.0.0.1:${XRAY_API_PORT} 2>/dev/null | \
-         jq -r '.stat[]? | "\(.name) \(.value // 0)"' > "$tmp_stats" 2>/dev/null; then
-        rm -f "$tmp_stats"
-        return 0
+    local has_data=false
+    
+    # === Xray 流量统计 ===
+    if _pgrep xray &>/dev/null; then
+        if xray api statsquery --server=127.0.0.1:${XRAY_API_PORT} 2>/dev/null | \
+             jq -r '.stat[]? | "\(.name // .Name) \(.value // .Value // 0)"' > "$tmp_stats" 2>/dev/null; then
+            
+            if [[ -s "$tmp_stats" ]]; then
+                # 遍历 Xray 用户
+                for proto in $(db_list_protocols "xray"); do
+                    local users=$(db_list_users "xray" "$proto")
+                    [[ -z "$users" ]] && continue
+                    
+                    for user in $users; do
+                        local email="${user}@${proto}"
+                        
+                        local uplink=$(grep -F "user>>>${email}>>>traffic>>>uplink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
+                        local downlink=$(grep -F "user>>>${email}>>>traffic>>>downlink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
+                        
+                        uplink=${uplink:-0}
+                        downlink=${downlink:-0}
+                        
+                        local total=$((uplink + downlink))
+                        if [[ "$total" -gt 0 ]]; then
+                            echo "${proto}|${user}|${uplink}|${downlink}|${total}"
+                            has_data=true
+                        fi
+                    done
+                done
+            fi
+        fi
     fi
     
-    [[ ! -s "$tmp_stats" ]] && { rm -f "$tmp_stats"; return 0; }
-    
-    # 遍历用户，用 grep 快速查找
-    for proto in $(db_list_protocols "xray"); do
-        local users=$(db_list_users "xray" "$proto")
-        [[ -z "$users" ]] && continue
-        
-        for user in $users; do
-            local email="${user}@${proto}"
-            
-            # 用 grep 从临时文件中提取流量值
-            local uplink=$(grep -F "user>>>${email}>>>traffic>>>uplink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
-            local downlink=$(grep -F "user>>>${email}>>>traffic>>>downlink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
-            
-            uplink=${uplink:-0}
-            downlink=${downlink:-0}
-            
-            local total=$((uplink + downlink))
-            echo "${proto}|${user}|${uplink}|${downlink}|${total}"
-        done
-    done
+    # 注：Sing-box 协议 (hy2/tuic) 暂不支持实时流量统计（需要完整版编译）
     
     rm -f "$tmp_stats"
 }
@@ -1941,12 +2020,14 @@ _handle_standalone_cert() {
             _warn "检测到 CA 签发的真实证书，不会覆盖"
             return 1
         fi
-        rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key" "$CFG/cert_domain"
+        rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key"
         gen_self_cert "$sni"
-        echo "$sni" > "$CFG/cert_domain"
+        # 自签证书使用独立的标记文件，不写入 cert_domain (避免与 ACME 证书混淆)
+        echo "$sni" > "$CFG/self_cert_sni"
+        rm -f "$CFG/cert_domain"  # 清除可能存在的 ACME 域名记录
     elif [[ ! -f "$CFG/certs/server.crt" ]]; then
         gen_self_cert "$sni"
-        echo "$sni" > "$CFG/cert_domain"
+        echo "$sni" > "$CFG/self_cert_sni"
     fi
     return 0
 }
@@ -4765,7 +4846,6 @@ EOF
 readonly COMMON_SNI_LIST=(
     "ads.apple.com"
     "advertising.apple.com"
-    "apple.apple.com"
     "apps.apple.com"
     "asia.apple.com"
     "books.apple.com"
@@ -5798,8 +5878,11 @@ setup_cert_and_nginx() {
         fi
     fi
     
-    # 使用自签证书
-    gen_self_cert "localhost"
+    # 使用自签证书（仅对需要真实 TLS 证书的协议）
+    # Reality 协议 (vless、vless-xhttp) 不需要证书，使用 TLS 指纹伪装
+    if [[ "$protocol" != "vless" && "$protocol" != "vless-xhttp" ]]; then
+        gen_self_cert "localhost"
+    fi
     return 1
 }
 
@@ -8270,9 +8353,31 @@ generate_singbox_config() {
                     fi
                 fi
                 
+                # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
+                local users_json="[]"
+                local db_users=$(jq -r --arg p "$proto" '
+                    .singbox[$p] as $cfg |
+                    if $cfg == null then empty
+                    elif ($cfg | type) == "array" then
+                        [$cfg[].users // [] | .[]] | unique_by(.name)
+                    else
+                        $cfg.users // []
+                    end
+                ' "$DB_FILE" 2>/dev/null)
+                
+                if [[ -n "$db_users" && "$db_users" != "[]" && "$db_users" != "null" ]]; then
+                    # 有自定义用户，为每个用户生成 {name, password}
+                    # hy2 用户的 uuid 字段存储的是密码
+                    local default_user_json=$(jq -n --arg pw "$password" '{name: "default", password: $pw}')
+                    users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" '[$chk_def] + ($db_users | map({name: .name, password: .uuid}))')
+                else
+                    # 没有自定义用户，使用默认密码
+                    users_json=$(jq -n --arg pw "$password" '[{name: "default", password: $pw}]')
+                fi
+                
                 inbound=$(jq -n \
                     --argjson port "$port" \
-                    --arg password "$password" \
+                    --argjson users "$users_json" \
                     --arg cert "$cert_path" \
                     --arg key "$key_path" \
                     --arg listen_addr "$listen_addr" \
@@ -8281,11 +8386,13 @@ generate_singbox_config() {
                     tag: "hy2-in",
                     listen: $listen_addr,
                     listen_port: $port,
-                    users: [{password: $password}],
+                    users: $users,
+                    ignore_client_bandwidth: true,
                     tls: {
                         enabled: true,
                         certificate_path: $cert,
-                        key_path: $key
+                        key_path: $key,
+                        alpn: ["h3"]
                     },
                     masquerade: "https://www.bing.com"
                 }')
@@ -8356,8 +8463,88 @@ generate_singbox_config() {
         return 1
     fi
     
-    # 合并配置并写入文件
-    echo "$base_config" | jq --argjson ibs "$inbounds" '.inbounds = $ibs' > "$CFG/singbox.json"
+    # 生成用户级路由规则 (auth_user) 和所需的 outbounds
+    local user_routing_rules="[]"
+    local user_outbounds="[]"
+    local chain_outbounds_added=""  # 跟踪已添加的链式代理 outbound
+    
+    for proto in $singbox_protocols; do
+        local db_users=$(jq -r --arg p "$proto" '
+            .singbox[$p] as $cfg |
+            if $cfg == null then empty
+            elif ($cfg | type) == "array" then
+                [$cfg[].users // [] | .[]] | unique_by(.name) | .[]
+            else
+                $cfg.users // [] | .[]
+            end | @json
+        ' "$DB_FILE" 2>/dev/null)
+        
+        while IFS= read -r user_json; do
+            [[ -z "$user_json" ]] && continue
+            local uname=$(echo "$user_json" | jq -r '.name // empty')
+            local urouting=$(echo "$user_json" | jq -r '.routing // empty')
+            
+            [[ -z "$uname" || -z "$urouting" || "$urouting" == "default" ]] && continue
+            
+            # 根据路由类型生成规则
+            local outbound_name=""
+            case "$urouting" in
+                warp|warp-wireguard|warp-official)
+                    outbound_name="warp"
+                    ;;
+                direct)
+                    outbound_name="direct"
+                    ;;
+                chain:*)
+                    # 链式代理支持
+                    local node_name="${urouting#chain:}"
+                    outbound_name="chain-${node_name}"
+                    
+                    # 检查该链式代理 outbound 是否已添加
+                    if [[ ! " $chain_outbounds_added " =~ " $outbound_name " ]]; then
+                        # 生成链式代理 outbound
+                        local chain_out=$(gen_singbox_chain_outbound "$node_name" "$outbound_name" "prefer_ipv4")
+                        if [[ -n "$chain_out" && "$chain_out" != "null" ]]; then
+                            user_outbounds=$(echo "$user_outbounds" | jq --argjson out "$chain_out" '. + [$out]')
+                            chain_outbounds_added="$chain_outbounds_added $outbound_name"
+                        else
+                            # 链式代理节点不存在，跳过
+                            continue
+                        fi
+                    fi
+                    ;;
+                *)
+                    # 其他路由类型暂不支持
+                    continue
+                    ;;
+            esac
+            
+            # 添加路由规则
+            user_routing_rules=$(echo "$user_routing_rules" | jq \
+                --arg user "$uname" \
+                --arg outbound "$outbound_name" \
+                '. + [{auth_user: [$user], outbound: $outbound}]')
+        done <<< "$db_users"
+    done
+    
+    # 将用户路由所需的 outbounds 添加到 base_config
+    if [[ "$user_outbounds" != "[]" ]]; then
+        base_config=$(echo "$base_config" | jq --argjson outs "$user_outbounds" '.outbounds = ($outs + (.outbounds // []))')
+    fi
+    
+    # 将用户路由规则添加到 base_config
+    if [[ "$user_routing_rules" != "[]" ]]; then
+        if echo "$base_config" | jq -e '.route' >/dev/null 2>&1; then
+            base_config=$(echo "$base_config" | jq --argjson ur "$user_routing_rules" '.route.rules = ($ur + .route.rules)')
+        else
+            base_config=$(echo "$base_config" | jq --argjson ur "$user_routing_rules" '. + {route: {rules: $ur, final: "direct"}}')
+        fi
+    fi
+    
+    # 合并配置并写入文件（不生成 v2ray_api，精简版 sing-box 不支持流量统计）
+    echo "$base_config" | jq \
+        --argjson ibs "$inbounds" \
+        '.inbounds = $ibs' > "$CFG/singbox.json"
     
     # 验证配置
     if ! jq empty "$CFG/singbox.json" 2>/dev/null; then
@@ -8972,8 +9159,8 @@ gen_tuic_server_config() {
         _info "为 TUIC 生成独立自签证书 (SNI: $sni)..."
         openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
             -keyout "$key_file" -out "$cert_file" \
-            -subj "/CN=$server_ip" -days 36500 \
-            -addext "subjectAltName=DNS:$server_ip,IP:$server_ip" \
+            -subj "/CN=$sni" -days 36500 \
+            -addext "subjectAltName=DNS:$sni" \
             -addext "basicConstraints=critical,CA:FALSE" \
             -addext "extendedKeyUsage=serverAuth" 2>/dev/null
         chmod 600 "$key_file"
@@ -13884,12 +14071,18 @@ gen_singbox_chain_outbound() {
             local fp=$(echo "$node" | jq -r '.fingerprint // "chrome"')
             local pbk=$(echo "$node" | jq -r '.publicKey // ""')
             local sid=$(echo "$node" | jq -r '.shortId // ""')
+            local flow=$(echo "$node" | jq -r '.flow // ""')
             local net=$(echo "$node" | jq -r '.network // "tcp"')
             local ws_path=$(echo "$node" | jq -r '.wsPath // "/"')
             local ws_host=$(echo "$node" | jq -r '.wsHost // ""')
             
             local base=$(jq -n --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg uuid "$uuid" --arg ds "$domain_strategy" \
                 '{tag:$tag,type:"vless",server:$server,server_port:$port,uuid:$uuid,domain_strategy:$ds}')
+            
+            # 添加 flow 字段（如 xtls-rprx-vision）
+            if [[ -n "$flow" && "$flow" != "null" && "$flow" != "" ]]; then
+                base=$(echo "$base" | jq --arg flow "$flow" '.flow = $flow')
+            fi
             
             # 处理 WebSocket 传输
             if [[ "$net" == "ws" ]]; then
@@ -15998,9 +16191,7 @@ show_single_protocol_info() {
             echo ""
             echo -e "  ${Y}Surge 配置:${NC}"
             echo -e "  ${C}${country_code}-TUIC = tuic-v5, ${config_ip}, ${display_port}, password=${password}, uuid=${uuid}, sni=${sni}, skip-cert-verify=true, alpn=h3${NC}"
-            echo ""
-            echo -e "  ${Y}Loon 配置:${NC}"
-            echo -e "  ${C}${country_code}-TUIC = TUIC, ${config_ip}, ${display_port}, \"${password}\", \"${uuid}\", udp=true, sni=${sni}, skip-cert-verify=true, alpn=h3${NC}"
+
             ;;
         socks)
             local use_tls=$(echo "$cfg" | jq -r '.tls // "false"')
@@ -23122,7 +23313,10 @@ _configure_tg_notify() {
         local chat_id=$(tg_get_config "chat_id")
         local daily_enabled=$(tg_get_config "notify_daily")
         local report_hour=$(tg_get_config "daily_report_hour")
+        local report_minute=$(tg_get_config "daily_report_minute")
         report_hour=${report_hour:-9}
+        report_minute=${report_minute:-0}
+        local report_time=$(printf "%02d:%02d" "$report_hour" "$report_minute")
         
         _header
         echo -e "  ${W}TG 通知配置${NC}"
@@ -23132,7 +23326,7 @@ _configure_tg_notify() {
         [[ "$enabled" == "true" ]] && status="${G}● 已启用${NC}"
         
         local daily_status="${D}○ 关闭${NC}"
-        [[ "$daily_enabled" == "true" ]] && daily_status="${G}● 每天 ${report_hour}:00${NC}"
+        [[ "$daily_enabled" == "true" ]] && daily_status="${G}● 每天 ${report_time}${NC}"
         
         # 检查定时任务状态
         local cron_status="${R}○ 未启用${NC}"
@@ -23245,26 +23439,76 @@ _configure_tg_notify() {
                 echo -e "  ${W}每日报告设置${NC}"
                 _line
                 if [[ "$daily_enabled" == "true" ]]; then
-                    echo -e "  当前状态: ${G}已启用${NC} (每天 ${report_hour}:00)"
-                    read -rp "  是否关闭每日报告? [y/N]: " disable_daily
-                    if [[ "$disable_daily" =~ ^[yY]$ ]]; then
-                        tg_set_config "notify_daily" "false"
-                        _ok "每日报告已关闭"
-                    fi
+                    echo -e "  当前状态: ${G}已启用${NC} (每天 ${report_time})"
+                    echo ""
+                    echo -e "  ${D}1) 修改发送时间${NC}"
+                    echo -e "  ${D}2) 关闭每日报告${NC}"
+                    echo -e "  ${D}0) 返回${NC}"
+                    read -rp "  请选择 [0]: " daily_choice
+                    case "$daily_choice" in
+                        1)
+                            echo ""
+                            echo -e "  ${D}设置发送时间 (格式: HH:MM 或 HH)${NC}"
+                            read -rp "  发送时间 [${report_time}]: " new_time
+                            new_time="${new_time:-$report_time}"
+                            local new_hour new_minute
+                            if [[ "$new_time" =~ ^([0-9]{1,2}):([0-9]{1,2})$ ]]; then
+                                new_hour="${BASH_REMATCH[1]}"
+                                new_minute="${BASH_REMATCH[2]}"
+                            elif [[ "$new_time" =~ ^[0-9]{1,2}$ ]]; then
+                                new_hour="$new_time"
+                                new_minute="0"
+                            else
+                                _err "无效的时间格式"
+                                continue
+                            fi
+                            # 移除前导零进行数值比较
+                            new_hour=$((10#$new_hour))
+                            new_minute=$((10#$new_minute))
+                            if [[ "$new_hour" -ge 0 ]] && [[ "$new_hour" -le 23 ]] && \
+                               [[ "$new_minute" -ge 0 ]] && [[ "$new_minute" -le 59 ]]; then
+                                tg_set_config "daily_report_hour" "$new_hour"
+                                tg_set_config "daily_report_minute" "$new_minute"
+                                _ok "发送时间已更新为 $(printf '%02d:%02d' $new_hour $new_minute)"
+                            else
+                                _err "无效的时间 (小时: 0-23, 分钟: 0-59)"
+                            fi
+                            ;;
+                        2)
+                            tg_set_config "notify_daily" "false"
+                            _ok "每日报告已关闭"
+                            ;;
+                    esac
                 else
                     echo -e "  当前状态: ${D}未启用${NC}"
                     read -rp "  是否启用每日报告? [Y/n]: " enable_daily
                     if [[ ! "$enable_daily" =~ ^[nN]$ ]]; then
                         echo ""
-                        echo -e "  ${D}设置发送时间 (0-23 点)${NC}"
-                        read -rp "  发送时间 [9]: " new_hour
-                        new_hour="${new_hour:-9}"
-                        if [[ "$new_hour" =~ ^[0-9]+$ ]] && [[ "$new_hour" -ge 0 ]] && [[ "$new_hour" -le 23 ]]; then
+                        echo -e "  ${D}设置发送时间 (格式: HH:MM 或 HH，例如: 9:30 或 9)${NC}"
+                        read -rp "  发送时间 [9:00]: " new_time
+                        new_time="${new_time:-9:00}"
+                        local new_hour new_minute
+                        if [[ "$new_time" =~ ^([0-9]{1,2}):([0-9]{1,2})$ ]]; then
+                            new_hour="${BASH_REMATCH[1]}"
+                            new_minute="${BASH_REMATCH[2]}"
+                        elif [[ "$new_time" =~ ^[0-9]{1,2}$ ]]; then
+                            new_hour="$new_time"
+                            new_minute="0"
+                        else
+                            _err "无效的时间格式"
+                            continue
+                        fi
+                        # 移除前导零进行数值比较
+                        new_hour=$((10#$new_hour))
+                        new_minute=$((10#$new_minute))
+                        if [[ "$new_hour" -ge 0 ]] && [[ "$new_hour" -le 23 ]] && \
+                           [[ "$new_minute" -ge 0 ]] && [[ "$new_minute" -le 59 ]]; then
                             tg_set_config "notify_daily" "true"
                             tg_set_config "daily_report_hour" "$new_hour"
-                            _ok "每日报告已启用，将在每天 ${new_hour}:00 发送"
+                            tg_set_config "daily_report_minute" "$new_minute"
+                            _ok "每日报告已启用，将在每天 $(printf '%02d:%02d' $new_hour $new_minute) 发送"
                         else
-                            _err "无效的时间"
+                            _err "无效的时间 (小时: 0-23, 分钟: 0-59)"
                         fi
                     fi
                 fi
@@ -23323,64 +23567,53 @@ _show_realtime_traffic() {
     echo -e "  ${W}实时流量统计${NC}"
     _dline
     
-    # 检测当前核心类型
-    local current_core=$(_detect_current_core)
+    # 检查是否有运行中的核心
+    local has_xray=false
+    local has_singbox=false
     
-    case "$current_core" in
-        "xray")
-            # 检查 Xray 是否运行
-            if ! _pgrep xray &>/dev/null; then
-                _err "Xray 未运行，无法获取流量统计"
-                return
-            fi
-            
-            echo ""
-            printf "  ${W}%-12s %-12s %-12s %-12s %-12s${NC}\n" "协议" "用户" "上行" "下行" "总计"
-            _line
-            
-            local stats=$(get_all_traffic_stats)
-            if [[ -z "$stats" ]]; then
-                echo -e "  ${D}暂无流量数据${NC}"
-            else
-                while IFS='|' read -r proto user uplink downlink total; do
-                    [[ -z "$proto" ]] && continue
-                    local proto_name=$(get_protocol_name "$proto")
-                    local up_fmt=$(format_bytes "$uplink")
-                    local down_fmt=$(format_bytes "$downlink")
-                    local total_fmt=$(format_bytes "$total")
-                    printf "  %-12s %-12s %-12s %-12s %-12s\n" "$proto_name" "$user" "$up_fmt" "$down_fmt" "$total_fmt"
-                done <<< "$stats"
-            fi
-            
-            _line
-            echo ""
-            echo -e "  ${D}提示: 此为 Xray 启动后的累计流量，同步后会重置${NC}"
-            ;;
-        "singbox")
-            echo ""
-            _warn "sing-box 核心暂不支持流量统计"
-            echo ""
-            echo -e "  ${D}说明: sing-box 的 clash_api 可以获取连接信息，${NC}"
-            echo -e "  ${D}      但精确的用户流量统计功能尚未实现。${NC}"
-            echo ""
-            echo -e "  ${D}如需流量统计功能，建议使用 Xray 核心。${NC}"
-            ;;
-        "standalone")
-            echo ""
-            _warn "独立协议不支持流量统计"
-            echo ""
-            echo -e "  ${D}说明: 独立协议 (Hysteria2/NaiveProxy 等) 没有统一的${NC}"
-            echo -e "  ${D}      流量统计 API，暂时无法统计用户流量。${NC}"
-            echo ""
-            echo -e "  ${D}如需流量统计功能，建议使用 Xray 核心部署协议。${NC}"
-            ;;
-        *)
-            echo ""
-            _warn "未检测到运行中的代理核心"
-            echo ""
-            echo -e "  ${D}请先安装并启动 Xray 核心的协议。${NC}"
-            ;;
-    esac
+    if _pgrep xray &>/dev/null; then
+        has_xray=true
+    fi
+    if _pgrep sing-box &>/dev/null; then
+        has_singbox=true
+    fi
+    
+    if [[ "$has_xray" == "false" && "$has_singbox" == "false" ]]; then
+        echo ""
+        _warn "未检测到运行中的代理核心"
+        echo ""
+        echo -e "  ${D}请先安装并启动 Xray 或 Sing-box 核心的协议。${NC}"
+        return
+    fi
+    
+    echo ""
+    printf "  ${W}%-12s %-12s %-12s %-12s %-12s${NC}\n" "协议" "用户" "上行" "下行" "总计"
+    _line
+    
+    local stats=$(get_all_traffic_stats)
+    if [[ -z "$stats" ]]; then
+        echo -e "  ${D}暂无流量数据${NC}"
+    else
+        while IFS='|' read -r proto user uplink downlink total; do
+            [[ -z "$proto" ]] && continue
+            local proto_name=$(get_protocol_name "$proto")
+            local up_fmt=$(format_bytes "$uplink")
+            local down_fmt=$(format_bytes "$downlink")
+            local total_fmt=$(format_bytes "$total")
+            printf "  %-12s %-12s %-12s %-12s %-12s\n" "$proto_name" "$user" "$up_fmt" "$down_fmt" "$total_fmt"
+        done <<< "$stats"
+    fi
+    
+    _line
+    echo ""
+    
+    # 显示提示
+    echo -e "  ${D}提示: 此为 Xray 启动后的累计流量，同步后会重置${NC}"
+    
+    # 如果有 Sing-box 运行，提示不支持流量统计
+    if [[ "$has_singbox" == "true" ]]; then
+        echo -e "  ${D}注意: Sing-box (hy2/tuic) 暂不支持流量统计（需完整版编译）${NC}"
+    fi
 }
 
 # 立即同步流量数据
@@ -23389,78 +23622,76 @@ _sync_traffic_now() {
     echo -e "  ${W}同步流量数据${NC}"
     _dline
     
-    # 检测当前核心类型
-    local current_core=$(_detect_current_core)
+    # 检查是否有运行中的核心
+    local has_xray=false
+    local has_singbox=false
     
-    case "$current_core" in
-        "xray")
-            # 检查 Xray 是否运行
-            if ! _pgrep xray &>/dev/null; then
-                _err "Xray 未运行，无法同步流量"
-                return
-            fi
-            
-            _info "正在同步流量数据..."
-            
-            if sync_all_user_traffic "true"; then
-                _ok "流量数据已同步到数据库"
-                echo ""
+    if _pgrep xray &>/dev/null; then
+        has_xray=true
+    fi
+    if _pgrep sing-box &>/dev/null; then
+        has_singbox=true
+    fi
+    
+    if [[ "$has_xray" == "false" && "$has_singbox" == "false" ]]; then
+        echo ""
+        _warn "未检测到运行中的代理核心"
+        echo ""
+        echo -e "  ${D}请先安装并启动 Xray 或 Sing-box 核心的协议。${NC}"
+        return
+    fi
+    
+    _info "正在同步流量数据..."
+    
+    if sync_all_user_traffic "true"; then
+        _ok "流量数据已同步到数据库"
+        echo ""
+        
+        # 显示同步后的统计
+        echo -e "  ${W}用户流量统计:${NC}"
+        _line
+        
+        # 显示 Xray 协议流量
+        if [[ "$has_xray" == "true" ]]; then
+            for proto in $(db_list_protocols "xray"); do
+                local proto_name=$(get_protocol_name "$proto")
+                local users=$(db_get_users_stats "xray" "$proto")
+                [[ -z "$users" ]] && continue
                 
-                # 显示同步后的统计
-                echo -e "  ${W}用户流量统计:${NC}"
-                _line
-                
-                for proto in $(db_list_protocols "xray"); do
-                    local proto_name=$(get_protocol_name "$proto")
-                    local users=$(db_get_users_stats "xray" "$proto")
-                    [[ -z "$users" ]] && continue
+                echo -e "  ${C}$proto_name${NC}"
+                while IFS='|' read -r name uuid used quota enabled port routing; do
+                    [[ -z "$name" ]] && continue
+                    local used_fmt=$(format_bytes "$used")
+                    local quota_fmt="无限制"
+                    local status="${G}●${NC}"
                     
-                    echo -e "  ${C}$proto_name${NC}"
-                    while IFS='|' read -r name uuid used quota enabled port routing; do
-                        [[ -z "$name" ]] && continue
-                        local used_fmt=$(format_bytes "$used")
-                        local quota_fmt="无限制"
-                        local status="${G}●${NC}"
-                        
-                        if [[ "$quota" -gt 0 ]]; then
-                            quota_fmt=$(format_bytes "$quota")
-                            local percent=$((used * 100 / quota))
-                            if [[ "$percent" -ge 100 ]]; then
-                                status="${R}✗${NC}"
-                            elif [[ "$percent" -ge 80 ]]; then
-                                status="${Y}⚠${NC}"
-                            fi
+                    if [[ "$quota" -gt 0 ]]; then
+                        quota_fmt=$(format_bytes "$quota")
+                        local percent=$((used * 100 / quota))
+                        if [[ "$percent" -ge 100 ]]; then
+                            status="${R}✗${NC}"
+                        elif [[ "$percent" -ge 80 ]]; then
+                            status="${Y}⚠${NC}"
                         fi
-                        
-                        [[ "$enabled" != "true" ]] && status="${R}○${NC}"
-                        
-                        echo -e "    $status $name: $used_fmt / $quota_fmt"
-                    done <<< "$users"
-                done
-                _line
-            else
-                _err "同步失败"
-            fi
-            ;;
-        "singbox")
+                    fi
+                    
+                    [[ "$enabled" != "true" ]] && status="${R}○${NC}"
+                    
+                    echo -e "    $status $name: $used_fmt / $quota_fmt"
+                done <<< "$users"
+            done
+        fi
+        
+        # Sing-box 协议 (hy2/tuic) 提示不支持流量统计
+        if [[ "$has_singbox" == "true" ]]; then
             echo ""
-            _warn "sing-box 核心暂不支持流量同步"
-            echo ""
-            echo -e "  ${D}流量统计功能仅支持 Xray 核心。${NC}"
-            ;;
-        "standalone")
-            echo ""
-            _warn "独立协议不支持流量同步"
-            echo ""
-            echo -e "  ${D}独立协议 (Hysteria2/NaiveProxy 等) 暂不支持流量统计。${NC}"
-            ;;
-        *)
-            echo ""
-            _warn "未检测到运行中的代理核心"
-            echo ""
-            echo -e "  ${D}请先安装并启动 Xray 核心的协议。${NC}"
-            ;;
-    esac
+            echo -e "  ${D}注意: Sing-box (hy2/tuic) 暂不支持流量统计（需完整版编译）${NC}"
+        fi
+        
+        _line
+    else
+        _err "同步失败"
+    fi
 }
 
 # 流量统计设置
