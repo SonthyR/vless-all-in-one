@@ -1,6 +1,6 @@
 #!/bin/bash 
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.4.7 [服务端]
+#  多协议代理一键部署脚本 v3.4.8 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -17,7 +17,7 @@
 #  项目地址: https://github.com/Chil30/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.4.7"
+readonly VERSION="3.4.8"
 readonly AUTHOR="Chil30"
 readonly REPO_URL="https://github.com/Chil30/vless-all-in-one"
 readonly SCRIPT_REPO="Chil30/vless-all-in-one"
@@ -420,6 +420,23 @@ gen_uuid() {
 gen_password() {
     local length="${1:-16}"
     head -c 32 /dev/urandom 2>/dev/null | base64 | tr -dc 'a-zA-Z0-9' | head -c "$length"
+}
+
+# 询问密码（支持自定义或自动生成）
+# 用法: ask_password [长度] [提示文本]
+ask_password() {
+    local length="${1:-16}"
+    local prompt="${2:-密码}"
+    local password=""
+    
+    read -rp "请输入${prompt} (直接回车自动生成): " password
+    
+    # 如果直接回车，生成随机密码
+    if [[ -z "$password" ]]; then
+        password=$(gen_password "$length")
+    fi
+    
+    echo "$password"
 }
 
 # 获取协议的中文显示名
@@ -17183,6 +17200,13 @@ do_uninstall() {
     echo ""
     echo -e "  ${C}如需删除证书，请执行:${NC}"
     echo -e "  ${G}rm -rf $CFG/certs $CFG/cert_domain${NC}"
+    echo ""
+    echo -e "  ${R}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${R}如需完全卸载并删除所有配置文件:${NC}"
+    echo -e "  ${Y}所有配置文件位于: ${G}$CFG${NC}"
+    echo -e "  ${Y}执行以下命令完全删除:${NC}"
+    echo -e "  ${G}rm -rf $CFG${NC}"
+    echo -e "  ${R}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -17936,7 +17960,8 @@ do_install_server() {
             gen_vless_vision_server_config "$uuid" "$port" "$final_sni"
             ;;
         socks)
-            local username_default=$(gen_password 8) password_default=$(gen_password)
+            local username_default=$(ask_password 8 "SOCKS5用户名")
+            local password_default=$(ask_password 16 "SOCKS5密码")
             local username="$username_default" password="$password_default"
             local use_tls="false" sni=""
             local auth_mode="password" listen_addr=""
@@ -18066,7 +18091,7 @@ do_install_server() {
                 install_shadowtls || { _err "ShadowTLS 安装失败"; _pause; return 1; }
                 
                 # 启用 ShadowTLS 模式
-                local stls_password=$(gen_password)
+                local stls_password=$(ask_password 16 "ShadowTLS密码")
                 local default_sni=$(gen_sni)
                 
                 echo ""
@@ -18140,7 +18165,7 @@ do_install_server() {
                 esac
             done
             
-            local password=$(gen_password)
+            local password=$(ask_password 16 "SS2022密码")
             
             echo ""
             _line
@@ -18159,7 +18184,7 @@ do_install_server() {
             gen_ss_legacy_server_config "$password" "$port" "$method"
             ;;
         hy2)
-            local password=$(gen_password)
+            local password=$(ask_password 16 "Hysteria2密码")
             local cert_domain=$(ask_cert_config "$(gen_sni)")
             
             # 询问SNI配置（在证书申请完成后）
@@ -18216,7 +18241,7 @@ do_install_server() {
             gen_hy2_server_config "$password" "$port" "$final_sni" "$hop_enable" "$hop_start" "$hop_end"
             ;;
         trojan)
-            local password=$(gen_password)
+            local password=$(ask_password 16 "Trojan密码")
             
             # 选择传输模式
             echo ""
@@ -18293,7 +18318,7 @@ do_install_server() {
                 stls_protocol="snell-shadowtls"
             else
                 version="5"
-                psk=$(gen_password)
+                psk=$(ask_password 16 "Snell v5 PSK")
                 stls_protocol="snell-v5-shadowtls"
             fi
             
@@ -18304,7 +18329,7 @@ do_install_server() {
                 install_shadowtls || { _err "ShadowTLS 安装失败"; _pause; return 1; }
                 
                 # 启用 ShadowTLS 模式
-                local stls_password=$(gen_password)
+                local stls_password=$(ask_password 16 "ShadowTLS密码")
                 local default_sni=$(gen_sni)
                 
                 echo ""
@@ -18361,7 +18386,8 @@ do_install_server() {
             fi
             ;;
         tuic)
-            local uuid=$(gen_uuid) password=$(gen_password)
+            local uuid=$(gen_uuid)
+            local password=$(ask_password 16 "TUIC密码")
             
             # TUIC不需要证书申请，直接询问SNI配置
             local final_sni=$(ask_sni_config "$(gen_sni)" "")
@@ -18417,7 +18443,7 @@ do_install_server() {
             gen_tuic_server_config "$uuid" "$password" "$port" "$final_sni" "$hop_enable" "$hop_start" "$hop_end"
             ;;
         anytls)
-            local password=$(gen_password)
+            local password=$(ask_password 16 "AnyTLS密码")
             
             # AnyTLS不需要证书申请，直接询问SNI配置
             local final_sni=$(ask_sni_config "$(gen_sni)" "")
@@ -18438,7 +18464,8 @@ do_install_server() {
             gen_anytls_server_config "$password" "$port" "$final_sni"
             ;;
         naive)
-            local username=$(gen_password 8) password=$(gen_password)
+            local username=$(ask_password 8 "NaïveProxy用户名")
+            local password=$(ask_password 16 "NaïveProxy密码")
             
             # NaïveProxy 推荐使用 443 端口
             echo ""
@@ -20244,6 +20271,12 @@ gen_surge_sub() {
                 hy2)
                     [[ -n "$server_ip" ]] && proxy="$name = hysteria2, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=true"
                     ;;
+                tuic)
+                    [[ -n "$server_ip" ]] && proxy="$name = tuic, $server_ip, $port, uuid=$uuid, password=$password, sni=$sni, skip-cert-verify=true, alpn=h3"
+                    ;;
+                anytls)
+                    [[ -n "$server_ip" ]] && proxy="$name = anytls, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=true"
+                    ;;
                 snell|snell-v5)
                     [[ -n "$server_ip" ]] && proxy="$name = snell, $server_ip, $port, psk=$psk, version=${version:-4}"
                     ;;
@@ -20484,20 +20517,35 @@ manage_subscription() {
                 3) manage_external_nodes ;;
                 4) setup_subscription_interactive ;;
                 5) 
-                    # 获取域名信息
-                    local sub_domain=""
+                    # 获取订阅端口和域名信息
+                    local sub_port="" sub_domain=""
                     if [[ -f "$CFG/sub.info" ]]; then
-                        sub_domain=$(grep "^sub_domain=" "$CFG/sub.info" 2>/dev/null | cut -d'=' -f2)
+                        source "$CFG/sub.info"
                     fi
                     
-                    rm -f /etc/nginx/conf.d/vless-sub.conf "$CFG/sub.info"
+                    # 删除配置文件
+                    rm -f /etc/nginx/conf.d/vless-sub.conf /etc/nginx/http.d/vless-sub.conf "$CFG/sub.info"
                     rm -rf "$CFG/subscription"
-                    nginx -s reload 2>/dev/null
                     
                     # 清理 hosts 记录
                     if [[ -n "$sub_domain" ]]; then
                         sed -i "/127.0.0.1 $sub_domain/d" /etc/hosts 2>/dev/null
                         _info "已清理 /etc/hosts 中的域名记录"
+                    fi
+                    
+                    # 检查是否还有其他 nginx 配置，如果没有则停止 nginx
+                    local other_configs=$(ls /etc/nginx/conf.d/*.conf /etc/nginx/http.d/*.conf 2>/dev/null | wc -l)
+                    if [[ "$other_configs" -eq 0 ]]; then
+                        _info "没有其他 Nginx 配置，停止 Nginx 服务..."
+                        if [[ "$DISTRO" == "alpine" ]]; then
+                            rc-service nginx stop 2>/dev/null
+                        else
+                            systemctl stop nginx 2>/dev/null
+                        fi
+                        _ok "Nginx 服务已停止"
+                    else
+                        _info "检测到其他 Nginx 配置，仅重载配置..."
+                        nginx -s reload 2>/dev/null
                     fi
                     
                     _ok "订阅服务已停用"
@@ -22762,7 +22810,7 @@ _add_user() {
             uuid=$(head -c $key_len /dev/urandom 2>/dev/null | base64 -w 0)
             ;;
         *)
-            uuid=$(gen_password)
+            uuid=$(ask_password 16 "用户密码")
             ;;
     esac
     

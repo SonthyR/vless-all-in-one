@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.8] - 2026-02-06
+
+### Added
+- 新增 Surge 订阅对 TUIC 和 AnyTLS 协议的支持
+- 新增完全卸载时的配置目录删除提示
+  - 显示配置文件所在目录 `/etc/vless-reality/`
+  - 提供完全删除命令 `rm -rf /etc/vless-reality/`
+- 新增自定义密码功能
+  - 适用于 SOCKS5、SS2022、Hysteria2、Trojan、Snell、TUIC、AnyTLS、NaïveProxy 等协议
+  - 添加用户时也支持自定义密码
+
+### Fixed
+- 修复停止订阅服务时 Nginx 未正确停止的问题
+  - 检查是否还有其他 Nginx 配置文件
+  - 如果没有其他配置，直接停止 Nginx 服务
+  - 如果有其他配置，仅重载 Nginx
+
 ## [3.4.7] - 2026-02-05
 
 ### Added
